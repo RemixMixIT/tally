@@ -140,7 +140,8 @@ impl Consent {
 #[derive(Debug, Clone, Serialize)]
 pub struct Account {
     pub id: i64,
-    pub consent_id: i64,
+    /// None for manual/offline accounts that were created without a TrueLayer consent.
+    pub consent_id: Option<i64>,
     pub truelayer_id: String,
     pub kind: String,
     pub display_name: String,

@@ -39,3 +39,38 @@ pub async fn patch(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
     Ok(Json(json!({ "ok": true })))
 }
+
+#[derive(Deserialize)]
+pub struct CreateManualBody {
+    pub name: String,
+    /// `current` | `savings` | `credit_card`
+    #[serde(rename = "type")]
+    pub account_type: String,
+    /// Opening balance in major units (pounds), e.g. 2500.00
+    pub opening_balance: Option<f64>,
+}
+
+/// POST /api/accounts — create a manual/offline account. No TrueLayer OAuth is triggered.
+pub async fn create(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateManualBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "name is required".into()));
+    }
+    let account_type = body.account_type.trim();
+    if !matches!(account_type, "current" | "savings" | "credit_card") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "type must be current, savings, or credit_card".into(),
+        ));
+    }
+    let opening_cents = body.opening_balance.map(|n| (n * 100.0).round() as i64);
+    let account = state
+        .db
+        .create_manual_account(name, account_type, opening_cents)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    Ok(Json(json!({ "account": account })))
+}

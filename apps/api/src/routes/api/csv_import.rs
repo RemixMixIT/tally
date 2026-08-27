@@ -5,6 +5,7 @@
 //!   2. POST /api/csv/commit   — apply mapping + account selection, batch-insert transactions
 //!
 //! Dedup: `provider_txn_id` is set to `csv:<sha256-of-row>` so re-uploads are idempotent.
+//! Parser is RFC 4180 (quoted fields, doubled quotes, commas inside quotes are not delimiters).
 
 use crate::AppState;
 use axum::extract::State;
@@ -32,7 +33,7 @@ pub struct PreviewReply {
     pub suggested: SuggestedMapping,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, PartialEq, Eq)]
 pub struct SuggestedMapping {
     pub date_column: Option<String>,
     pub description_column: Option<String>,
@@ -42,31 +43,41 @@ pub struct SuggestedMapping {
     pub balance_column: Option<String>,
 }
 
-pub async fn preview(Json(body): Json<PreviewBody>) -> Result<Json<PreviewReply>, (StatusCode, String)> {
-    let mut rdr = ReaderBuilder::new()
+/// RFC 4180 reader: commas inside double-quoted fields are not delimiters; `""` is an escaped quote.
+fn csv_reader(content: &str) -> csv::Reader<&[u8]> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
-        .from_reader(body.content.as_bytes());
+        .quoting(true)
+        .double_quote(true)
+        .from_reader(content.as_bytes())
+}
+
+fn read_table(content: &str) -> Result<(Vec<String>, Vec<Vec<String>>), (StatusCode, String)> {
+    let mut rdr = csv_reader(content);
     let headers: Vec<String> = rdr
         .headers()
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad CSV headers: {e}")))?
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let mut sample_rows = Vec::new();
-    let mut count = 0;
+    let mut rows = Vec::new();
     for (i, rec) in rdr.records().enumerate() {
         let rec = rec.map_err(|e| (StatusCode::BAD_REQUEST, format!("bad CSV row {i}: {e}")))?;
-        if sample_rows.len() < 5 {
-            sample_rows.push(rec.iter().map(|s| s.to_string()).collect());
-        }
-        count += 1;
+        rows.push(rec.iter().map(|s| s.to_string()).collect());
     }
+    Ok((headers, rows))
+}
+
+pub async fn preview(Json(body): Json<PreviewBody>) -> Result<Json<PreviewReply>, (StatusCode, String)> {
+    let (headers, rows) = read_table(&body.content)?;
+    let sample_rows = rows.iter().take(5).cloned().collect();
     let suggested = suggest_mapping(&headers);
     Ok(Json(PreviewReply {
         headers,
         sample_rows,
-        row_count: count,
+        row_count: rows.len(),
         suggested,
     }))
 }
@@ -89,24 +100,29 @@ pub struct CommitMapping {
     pub credit_column: Option<String>,
     pub debit_column: Option<String>,
     /// Date format string (chrono syntax), e.g. "%d/%m/%Y" for Nationwide.
-    /// Defaults try ISO 8601, then DD/MM/YYYY, then MM/DD/YYYY.
+    /// Defaults try ISO 8601 (`%Y-%m-%d`), then DD/MM/YYYY, then MM/DD/YYYY.
     pub date_format: Option<String>,
+}
+
+fn nonempty(s: &Option<String>) -> Option<&str> {
+    s.as_deref().map(str::trim).filter(|s| !s.is_empty())
 }
 
 pub async fn commit(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CommitBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let mut rdr = ReaderBuilder::new()
-        .has_headers(true)
-        .flexible(true)
-        .from_reader(body.content.as_bytes());
-    let headers: Vec<String> = rdr
-        .headers()
-        .map_err(bad)?
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    if state
+        .db
+        .get_account(body.account_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
+        .is_none()
+    {
+        return Err((StatusCode::BAD_REQUEST, "unknown account".into()));
+    }
+
+    let (headers, rows) = read_table(&body.content)?;
 
     let idx = |name: &str| -> Result<usize, (StatusCode, String)> {
         headers
@@ -116,9 +132,9 @@ pub async fn commit(
     };
     let date_i = idx(&body.mapping.date_column)?;
     let desc_i = idx(&body.mapping.description_column)?;
-    let amount_i = body.mapping.amount_column.as_deref().map(idx).transpose()?;
-    let credit_i = body.mapping.credit_column.as_deref().map(idx).transpose()?;
-    let debit_i = body.mapping.debit_column.as_deref().map(idx).transpose()?;
+    let amount_i = nonempty(&body.mapping.amount_column).map(idx).transpose()?;
+    let credit_i = nonempty(&body.mapping.credit_column).map(idx).transpose()?;
+    let debit_i = nonempty(&body.mapping.debit_column).map(idx).transpose()?;
 
     if amount_i.is_none() && credit_i.is_none() && debit_i.is_none() {
         return Err((
@@ -132,51 +148,35 @@ pub async fn commit(
     let mut skipped = 0i64;
     let mut errors: Vec<String> = Vec::new();
 
-    for (row_n, rec) in rdr.records().enumerate() {
-        let Ok(rec) = rec else {
-            errors.push(format!("row {row_n}: parse failed"));
-            continue;
-        };
-        let raw_row: String = rec.iter().collect::<Vec<_>>().join("\u{1f}");
+    for (row_n, rec) in rows.iter().enumerate() {
+        let cell = |i: usize| rec.get(i).map(|s| s.as_str()).unwrap_or("");
+        let raw_row: String = rec.join("\u{1f}");
         let mut h = Sha256::new();
         h.update(raw_row.as_bytes());
-        let hash = format!(
-            "csv:{}:{:x}",
-            body.account_id,
-            h.finalize()
-        );
+        let hash = format!("csv:{}:{:x}", body.account_id, h.finalize());
 
-        let date_str = rec.get(date_i).unwrap_or("").trim();
-        let desc = rec.get(desc_i).unwrap_or("").trim().to_string();
-        let ts = parse_date(date_str, body.mapping.date_format.as_deref());
+        let date_str = cell(date_i).trim();
+        let desc = cell(desc_i).trim().to_string();
+        let ts = parse_date(date_str, nonempty(&body.mapping.date_format));
         let Some(ts) = ts else {
             errors.push(format!("row {row_n}: couldn't parse date '{date_str}'"));
             continue;
         };
 
-        let (is_credit, amount_cents) = if let Some(ai) = amount_i {
-            let v = rec.get(ai).unwrap_or("0").trim().replace(",", "").replace("£", "");
-            let n: f64 = v.parse().unwrap_or(0.0);
-            (n >= 0.0, (n.abs() * 100.0).round() as i64)
+        // Prefer split Credit/Debit when those columns are mapped — even if an amount
+        // column was also selected — so Smile-style Money In / Money Out CSVs work.
+        let amount = if credit_i.is_some() || debit_i.is_some() {
+            let c = credit_i.map(cell).unwrap_or("");
+            let d = debit_i.map(cell).unwrap_or("");
+            credit_debit_amount(c, d)
+        } else if let Some(ai) = amount_i {
+            Some(signed_amount(cell(ai)))
         } else {
-            let c = credit_i
-                .and_then(|i| rec.get(i))
-                .map(|s| s.trim().replace(",", "").replace("£", ""))
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0);
-            let d = debit_i
-                .and_then(|i| rec.get(i))
-                .map(|s| s.trim().replace(",", "").replace("£", ""))
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0);
-            if c > 0.0 {
-                (true, (c * 100.0).round() as i64)
-            } else if d > 0.0 {
-                (false, (d * 100.0).round() as i64)
-            } else {
-                skipped += 1;
-                continue;
-            }
+            None
+        };
+        let Some((is_credit, amount_cents)) = amount else {
+            skipped += 1;
+            continue;
         };
 
         if state.db.is_txn_seen(body.account_id, &hash).await.unwrap_or(false) {
@@ -224,13 +224,51 @@ pub async fn commit(
     })))
 }
 
+/// Empty / whitespace / unparseable money strings are treated as zero.
+fn parse_money(s: &str) -> f64 {
+    let t = s.trim().replace(",", "").replace("£", "");
+    if t.is_empty() {
+        0.0
+    } else {
+        t.parse().unwrap_or(0.0)
+    }
+}
+
+/// Split Credit (Money In) / Debit (Money Out): credit → positive, debit → negative.
+/// Both empty (zero) → None so the row can be skipped.
+fn credit_debit_amount(credit: &str, debit: &str) -> Option<(bool, i64)> {
+    let c = parse_money(credit);
+    let d = parse_money(debit);
+    if c != 0.0 {
+        Some((true, (c.abs() * 100.0).round() as i64))
+    } else if d != 0.0 {
+        Some((false, (d.abs() * 100.0).round() as i64))
+    } else {
+        None
+    }
+}
+
+fn signed_amount(raw: &str) -> (bool, i64) {
+    let n = parse_money(raw);
+    (n >= 0.0, (n.abs() * 100.0).round() as i64)
+}
+
 fn parse_date(s: &str, explicit_fmt: Option<&str>) -> Option<i64> {
+    let s = s.trim();
     if let Some(fmt) = explicit_fmt {
         if let Ok(d) = NaiveDate::parse_from_str(s, fmt) {
             return Some(d.and_hms_opt(0, 0, 0)?.and_utc().timestamp());
         }
     }
-    for fmt in &["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%d %b %Y", "%d %B %Y"] {
+    for fmt in &[
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%m/%d/%Y",
+        "%d-%m-%Y",
+        "%d %b %Y",
+        "%d %B %Y",
+        "%Y/%m/%d",
+    ] {
         if let Ok(d) = NaiveDate::parse_from_str(s, fmt) {
             return Some(d.and_hms_opt(0, 0, 0)?.and_utc().timestamp());
         }
@@ -252,16 +290,114 @@ fn suggest_mapping(headers: &[String]) -> SuggestedMapping {
             })
             .cloned()
     };
+    let credit_column = find(&["credit", "money in", "paid in", "deposit"]);
+    let debit_column = find(&["debit", "money out", "paid out", "withdrawal"]);
+    // When the file is split Credit/Debit, don't also suggest a single Amount column —
+    // that would take precedence in older importers and drop the sign.
+    let amount_column = if credit_column.is_some() || debit_column.is_some() {
+        None
+    } else {
+        find(&["amount", "value"])
+    };
     SuggestedMapping {
         date_column: find(&["date", "transaction date"]),
         description_column: find(&["description", "narrative", "details", "transaction"]),
-        amount_column: find(&["amount", "value"]),
-        credit_column: find(&["credit", "money in", "paid in", "deposit"]),
-        debit_column: find(&["debit", "money out", "paid out", "withdrawal"]),
+        amount_column,
+        credit_column,
+        debit_column,
         balance_column: find(&["balance"]),
     }
 }
 
-fn bad<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
-    (StatusCode::BAD_REQUEST, format!("{e}"))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SMILE: &str = r#""Date","Description","Type","Money In","Money Out","Balance"
+"2026-08-27","John Lancaster","CREDIT","2500.00","","3005.32"
+"2026-08-24","KCOM GROUP LTD","DD","","40.99","555.51"
+"2026-08-20","TESCO, HULL","POS","","12.50","543.01"
+"#;
+
+    #[test]
+    fn quoted_fields_and_embedded_commas() {
+        let (headers, rows) = read_table(SMILE).unwrap();
+        assert_eq!(
+            headers,
+            vec!["Date", "Description", "Type", "Money In", "Money Out", "Balance"]
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][1], "John Lancaster");
+        assert_eq!(rows[0][3], "2500.00");
+        assert_eq!(rows[0][4], "");
+        assert_eq!(rows[1][1], "KCOM GROUP LTD");
+        assert_eq!(rows[1][3], "");
+        assert_eq!(rows[1][4], "40.99");
+        // Comma inside quotes is not a delimiter.
+        assert_eq!(rows[2][1], "TESCO, HULL");
+        assert_eq!(rows[2].len(), 6);
+    }
+
+    #[test]
+    fn smile_column_suggestions() {
+        let (headers, _) = read_table(SMILE).unwrap();
+        let s = suggest_mapping(&headers);
+        assert_eq!(s.date_column.as_deref(), Some("Date"));
+        assert_eq!(s.description_column.as_deref(), Some("Description"));
+        assert_eq!(s.credit_column.as_deref(), Some("Money In"));
+        assert_eq!(s.debit_column.as_deref(), Some("Money Out"));
+        assert_eq!(s.amount_column, None, "split credit/debit must not also suggest Amount");
+    }
+
+    #[test]
+    fn empty_credit_debit_is_zero_and_signs() {
+        // Credit filled, debit empty → inbound.
+        assert_eq!(credit_debit_amount("2500.00", ""), Some((true, 250_000)));
+        assert_eq!(credit_debit_amount("2500.00", "   "), Some((true, 250_000)));
+        // Debit filled, credit empty → outbound (is_credit = false).
+        assert_eq!(credit_debit_amount("", "40.99"), Some((false, 4099)));
+        assert_eq!(credit_debit_amount("", ""), None);
+        assert_eq!(parse_money(""), 0.0);
+        assert_eq!(parse_money("  "), 0.0);
+    }
+
+    #[test]
+    fn iso_date_ymd() {
+        let ts = parse_date("2026-08-27", None).unwrap();
+        let d = chrono::DateTime::from_timestamp(ts, 0).unwrap().date_naive();
+        assert_eq!(d.to_string(), "2026-08-27");
+        assert_eq!(
+            parse_date("2026-08-27", Some("%Y-%m-%d")).unwrap(),
+            ts
+        );
+    }
+
+    #[test]
+    fn smile_rows_map_to_signed_amounts() {
+        let (headers, rows) = read_table(SMILE).unwrap();
+        let s = suggest_mapping(&headers);
+        let date_i = headers.iter().position(|h| h == s.date_column.as_ref().unwrap()).unwrap();
+        let desc_i = headers.iter().position(|h| h == s.description_column.as_ref().unwrap()).unwrap();
+        let credit_i = headers.iter().position(|h| h == s.credit_column.as_ref().unwrap()).unwrap();
+        let debit_i = headers.iter().position(|h| h == s.debit_column.as_ref().unwrap()).unwrap();
+
+        let mapped: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                let ts = parse_date(&r[date_i], None).unwrap();
+                let (is_credit, cents) = credit_debit_amount(&r[credit_i], &r[debit_i]).unwrap();
+                (ts, r[desc_i].clone(), is_credit, cents)
+            })
+            .collect();
+
+        assert_eq!(mapped[0].1, "John Lancaster");
+        assert!(mapped[0].2);
+        assert_eq!(mapped[0].3, 250_000);
+        assert_eq!(mapped[1].1, "KCOM GROUP LTD");
+        assert!(!mapped[1].2);
+        assert_eq!(mapped[1].3, 4099);
+        assert_eq!(mapped[2].1, "TESCO, HULL");
+        assert!(!mapped[2].2);
+        assert_eq!(mapped[2].3, 1250);
+    }
 }

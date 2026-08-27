@@ -19,6 +19,21 @@ type Preview = {
   };
 };
 
+const DATE_FORMATS: { label: string; value: string }[] = [
+  { label: "Auto-detect", value: "" },
+  { label: "YYYY-MM-DD", value: "%Y-%m-%d" },
+  { label: "DD/MM/YYYY", value: "%d/%m/%Y" },
+  { label: "MM/DD/YYYY", value: "%m/%d/%Y" },
+  { label: "DD-MM-YYYY", value: "%d-%m-%Y" },
+  { label: "DD Mon YYYY", value: "%d %b %Y" },
+];
+
+function accountLabel(a: Account) {
+  const name = a.custom_display_name ?? a.display_name;
+  const bank = a.consent_nickname ?? "manual";
+  return `${name} (${bank})`;
+}
+
 function ImportCsvPage() {
   const accounts = useQuery({ queryKey: ["accounts"], queryFn: () => api.get<{ accounts: Account[] }>("/api/accounts") });
   const [content, setContent] = useState("");
@@ -34,14 +49,15 @@ function ImportCsvPage() {
   });
 
   const previewMut = useMutation({
-    mutationFn: () => api.post<Preview>("/api/csv/preview", { content }),
+    mutationFn: (text: string) => api.post<Preview>("/api/csv/preview", { content: text }),
     onSuccess: (p) => {
       setPreview(p);
+      const split = !!(p.suggested.credit_column || p.suggested.debit_column);
       setMapping((m) => ({
         ...m,
         date_column: p.suggested.date_column ?? "",
         description_column: p.suggested.description_column ?? "",
-        amount_column: p.suggested.amount_column ?? "",
+        amount_column: split ? "" : (p.suggested.amount_column ?? ""),
         credit_column: p.suggested.credit_column ?? "",
         debit_column: p.suggested.debit_column ?? "",
       }));
@@ -62,6 +78,8 @@ function ImportCsvPage() {
     }),
   });
 
+  const accountList = accounts.data?.accounts ?? [];
+
   return (
     <div className="p-6 md:p-8 max-w-3xl space-y-4">
       <h1 className="text-3xl font-bold tracking-tight">Import CSV</h1>
@@ -79,10 +97,13 @@ function ImportCsvPage() {
             if (!f) return;
             const text = await f.text();
             setContent(text);
-            previewMut.mutate();
+            previewMut.mutate(text);
           }}
         />
       </label>
+      {previewMut.isError && (
+        <p className="text-sm text-danger">Could not parse CSV. Check the file is comma-separated.</p>
+      )}
 
       {preview && (
         <div className="card p-4 space-y-3">
@@ -91,8 +112,8 @@ function ImportCsvPage() {
           <div className="grid grid-cols-2 gap-2">
             <select className="input" value={mapping.account_id || ""} onChange={(e) => setMapping((m) => ({ ...m, account_id: Number(e.target.value) }))}>
               <option value="">— pick account —</option>
-              {accounts.data?.accounts.map((a) => (
-                <option key={a.id} value={a.id}>{a.display_name}</option>
+              {accountList.map((a) => (
+                <option key={a.id} value={a.id}>{accountLabel(a)}</option>
               ))}
             </select>
             <ColPicker headers={preview.headers} label="Date" value={mapping.date_column} onChange={(v) => setMapping((m) => ({ ...m, date_column: v }))} />
@@ -100,8 +121,17 @@ function ImportCsvPage() {
             <ColPicker headers={preview.headers} label="Amount" value={mapping.amount_column} onChange={(v) => setMapping((m) => ({ ...m, amount_column: v }))} />
             <ColPicker headers={preview.headers} label="Credit (in)" value={mapping.credit_column} onChange={(v) => setMapping((m) => ({ ...m, credit_column: v }))} />
             <ColPicker headers={preview.headers} label="Debit (out)" value={mapping.debit_column} onChange={(v) => setMapping((m) => ({ ...m, debit_column: v }))} />
-            <input className="input" placeholder="Date format (optional, chrono syntax, e.g. %d/%m/%Y)" value={mapping.date_format} onChange={(e) => setMapping((m) => ({ ...m, date_format: e.target.value }))} />
+            <select className="input" value={mapping.date_format} onChange={(e) => setMapping((m) => ({ ...m, date_format: e.target.value }))}>
+              {DATE_FORMATS.map((f) => (
+                <option key={f.value || "auto"} value={f.value}>{f.label}</option>
+              ))}
+            </select>
           </div>
+          {accountList.length === 0 && (
+            <p className="text-xs text-mid">
+              No accounts yet. Create a manual account on the Banks page, then come back to import.
+            </p>
+          )}
 
           <table className="text-xs w-full">
             <thead>
@@ -123,6 +153,9 @@ function ImportCsvPage() {
             <p className="text-sm text-success">
               Imported {commit.data.imported}, skipped {commit.data.skipped} (already seen). {commit.data.errors.length} errors.
             </p>
+          )}
+          {commit.isError && (
+            <p className="text-sm text-danger">Import failed. Check the column mapping and date format.</p>
           )}
         </div>
       )}

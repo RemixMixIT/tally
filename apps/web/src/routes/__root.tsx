@@ -136,7 +136,9 @@ function RootLayout() {
           </button>
         </div>
       </aside>
-      <main className="flex-1 min-w-0 overflow-x-hidden">
+      {/* overflow-x-clip (not hidden): hidden forces overflow-y to auto, which clips
+          popovers that hang off filter bars (e.g. the transactions account dropdown). */}
+      <main className="flex-1 min-w-0 overflow-x-clip">
         <Outlet />
       </main>
     </div>

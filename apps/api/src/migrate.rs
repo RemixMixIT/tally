@@ -4,7 +4,7 @@
 //! `_sqlx_migrations` ledger with `success = 1`. Checksums are intentionally NEVER compared —
 //! that structurally eliminates the historical "migration N was previously applied but has
 //! been modified" crash class. The ledger keeps a schema compatible with sqlx's, so a database
-//! already migrated by the old sqlx path (e.g. the production Pi, versions 1..12) reports every
+//! already migrated by the old sqlx path (e.g. the production Pi) reports every
 //! version applied and re-runs nothing.
 
 use anyhow::{Context, Result};
@@ -30,6 +30,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration { version: 10, name: "reminders", sql: include_str!("../migrations/0010_reminders.sql") },
     Migration { version: 11, name: "watchlist", sql: include_str!("../migrations/0011_watchlist.sql") },
     Migration { version: 12, name: "drop_watchlist", sql: include_str!("../migrations/0012_drop_watchlist.sql") },
+    Migration { version: 13, name: "manual_accounts", sql: include_str!("../migrations/0013_manual_accounts.sql") },
 ];
 
 const LEDGER_DDL: &str = "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
@@ -124,10 +125,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_db_applies_all_twelve() {
+    async fn fresh_db_applies_all_thirteen() {
         let conn = mem().await;
         run(&conn).await.unwrap();
-        assert_eq!(applied_versions(&conn).await, (1..=12).collect::<Vec<_>>());
+        assert_eq!(applied_versions(&conn).await, (1..=13).collect::<Vec<_>>());
         // The real migration SQL produced real tables under libsql (dialect smoke check).
         assert!(app_table_count(&conn).await > 0);
     }
@@ -137,18 +138,18 @@ mod tests {
         let conn = mem().await;
         run(&conn).await.unwrap();
         run(&conn).await.unwrap(); // second run must be a no-op, not an error
-        assert_eq!(applied_versions(&conn).await, (1..=12).collect::<Vec<_>>());
+        assert_eq!(applied_versions(&conn).await, (1..=13).collect::<Vec<_>>());
     }
 
     #[tokio::test]
     async fn preseeded_ledger_runs_nothing() {
-        // Simulate the production Pi: ledger records 1..12 as applied (with a non-empty checksum
-        // that must never be read), but the tables do NOT exist. A version-presence runner must
-        // skip all 12; a checksum-reading runner would crash, and a re-running one would build
-        // tables. We assert no app table was created.
+        // Simulate a DB whose ledger already records every known version as applied (with a
+        // non-empty checksum that must never be read), but the tables do NOT exist. A
+        // version-presence runner must skip all of them; a checksum-reading runner would crash,
+        // and a re-running one would build tables. We assert no app table was created.
         let conn = mem().await;
         conn.execute_batch(LEDGER_DDL).await.unwrap();
-        for v in 1..=12i64 {
+        for v in 1..=13i64 {
             conn.execute(
                 "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
                  VALUES (?1, 'x', 1, ?2, 0)",

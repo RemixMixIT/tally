@@ -1,4 +1,4 @@
-//! Standalone validation that all 12 real migrations apply cleanly under libsql, mirroring the
+//! Standalone validation that all real migrations apply cleanly under libsql, mirroring the
 //! runner in src/migrate.rs. Lives in tests/ (libsql-only link unit) so it sidesteps the
 //! sqlx/libsql duplicate-SQLite-symbol clash while the in-binary cutover is staged.
 
@@ -17,6 +17,7 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
     (10, "reminders", include_str!("../migrations/0010_reminders.sql")),
     (11, "watchlist", include_str!("../migrations/0011_watchlist.sql")),
     (12, "drop_watchlist", include_str!("../migrations/0012_drop_watchlist.sql")),
+    (13, "manual_accounts", include_str!("../migrations/0013_manual_accounts.sql")),
 ];
 
 async fn run(conn: &Connection) -> anyhow::Result<()> {
@@ -65,12 +66,12 @@ async fn versions(conn: &Connection) -> Vec<i64> {
 }
 
 #[tokio::test]
-async fn all_twelve_migrations_apply_under_libsql() {
+async fn all_migrations_apply_under_libsql() {
     let db = Builder::new_local(":memory:").build().await.unwrap();
     let conn = db.connect().unwrap();
 
     run(&conn).await.unwrap();
-    assert_eq!(versions(&conn).await, (1..=12).collect::<Vec<_>>());
+    assert_eq!(versions(&conn).await, (1..=13).collect::<Vec<_>>());
 
     // The real migration SQL produced real tables under libsql's dialect.
     let mut rows = conn
@@ -86,5 +87,5 @@ async fn all_twelve_migrations_apply_under_libsql() {
 
     // Idempotent re-run.
     run(&conn).await.unwrap();
-    assert_eq!(versions(&conn).await, (1..=12).collect::<Vec<_>>());
+    assert_eq!(versions(&conn).await, (1..=13).collect::<Vec<_>>());
 }

@@ -44,6 +44,9 @@ function BanksPage() {
   });
 
   const [nickname, setNickname] = useState("");
+  const [manualName, setManualName] = useState("");
+  const [manualType, setManualType] = useState<"current" | "savings" | "credit_card">("current");
+  const [manualOpening, setManualOpening] = useState("");
 
   const rename = useMutation({
     mutationFn: ({ id, nickname }: { id: number; nickname: string }) =>
@@ -70,13 +73,33 @@ function BanksPage() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["consents"] }),
   });
 
-  // Group accounts by consent for the cards.
-  const accountsByConsent = (accounts.data?.accounts ?? []).reduce<
-    Record<number, Account[]>
-  >((acc, a) => {
-    (acc[a.consent_id] = acc[a.consent_id] ?? []).push(a);
-    return acc;
-  }, {});
+  const createManual = useMutation({
+    mutationFn: () =>
+      api.post<{ account: Account }>("/api/accounts", {
+        name: manualName.trim(),
+        type: manualType,
+        opening_balance: manualOpening.trim() === "" ? null : Number(manualOpening),
+      }),
+    onSuccess: () => {
+      setManualName("");
+      setManualOpening("");
+      qc.invalidateQueries({ queryKey: ["accounts"] });
+    },
+  });
+
+  const allAccounts = accounts.data?.accounts ?? [];
+  const manualAccounts = allAccounts.filter((a) => a.consent_id == null);
+  const linkedAccounts = allAccounts.filter((a) => a.consent_id != null);
+
+  // Group linked (Open Banking) accounts by consent for the cards.
+  const accountsByConsent = linkedAccounts.reduce<Record<number, Account[]>>(
+    (acc, a) => {
+      const cid = a.consent_id as number;
+      (acc[cid] = acc[cid] ?? []).push(a);
+      return acc;
+    },
+    {}
+  );
 
   return (
     <div className="p-8 md:p-12 space-y-8">
@@ -134,6 +157,82 @@ function BanksPage() {
           </div>
         </div>
       </section>
+
+      {/* Manual / offline account — no Open Banking, CSV import target */}
+      <section className="card p-6 md:p-8 fade-in-1">
+        <label className="block text-[10px] uppercase tracking-widest text-mid mb-2">
+          Create manual account
+        </label>
+        <p className="text-xs text-mid mb-4">
+          For banks that don't support Open Banking. Import transactions from a CSV afterwards.
+        </p>
+        <form
+          className="grid grid-cols-1 md:grid-cols-4 gap-3 items-end"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (manualName.trim()) createManual.mutate();
+          }}
+        >
+          <div className="md:col-span-2">
+            <input
+              className="input"
+              placeholder="Name (e.g. Smile, Vanquis)"
+              value={manualName}
+              onChange={(e) => setManualName(e.target.value)}
+              required
+            />
+          </div>
+          <select
+            className="input"
+            value={manualType}
+            onChange={(e) =>
+              setManualType(e.target.value as "current" | "savings" | "credit_card")
+            }
+          >
+            <option value="current">Current</option>
+            <option value="savings">Savings</option>
+            <option value="credit_card">Credit card</option>
+          </select>
+          <input
+            className="input"
+            placeholder="Opening balance (optional)"
+            inputMode="decimal"
+            value={manualOpening}
+            onChange={(e) => setManualOpening(e.target.value)}
+          />
+          <button className="btn-primary md:col-span-4" type="submit" disabled={createManual.isPending}>
+            {createManual.isPending ? "Creating…" : "Create manual account"}
+          </button>
+        </form>
+        {createManual.isError && (
+          <p className="text-xs text-danger mt-2">Could not create account. Check the name and try again.</p>
+        )}
+      </section>
+
+      {manualAccounts.length > 0 && (
+        <section className="space-y-4 fade-in-2">
+          <h2 className="text-sm font-semibold uppercase tracking-widest text-mid">
+            {manualAccounts.length} manual
+          </h2>
+          <article className="card p-6 space-y-4">
+            <header>
+              <h3 className="text-xl font-extrabold">Offline accounts</h3>
+              <p className="text-[11px] text-mid mt-1">
+                No Open Banking sync — load transactions via CSV import.
+              </p>
+            </header>
+            <ul className="space-y-2.5">
+              {manualAccounts.map((a) => (
+                <AccountRow
+                  key={a.id}
+                  account={a}
+                  onRename={(name) => renameAccount.mutate({ id: a.id, name })}
+                />
+              ))}
+            </ul>
+          </article>
+        </section>
+      )}
 
       {/* Linked banks — card grid */}
       <section className="space-y-4 fade-in-2">

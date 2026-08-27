@@ -3,22 +3,18 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   flexRender,
   getCoreRowModel,
-  getFilteredRowModel,
   getSortedRowModel,
   useReactTable,
   type ColumnDef,
   type SortingState,
 } from "@tanstack/react-table";
-import { useVirtualizer } from "@tanstack/react-virtual";
-import { useMemo, useRef, useState } from "react";
-import { z } from "zod";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Sparkles,
   ArrowDownRight,
   ArrowUpRight,
   Search,
   X,
-  RefreshCw,
   Tag,
   Hash,
   Calendar,
@@ -35,27 +31,19 @@ import type {
   TransactionsListResponse,
 } from "@/types/api";
 
-const searchSchema = z.object({
-  account_ids: z.string().optional(),
-  category_ids: z.string().optional(),
-  q: z.string().optional(),
-  from: z.coerce.number().optional(),
-  to: z.coerce.number().optional(),
-});
-
 export const Route = createFileRoute("/transactions")({
-  validateSearch: searchSchema,
   component: TransactionsPage,
 });
 
 function TransactionsPage() {
-  const search = Route.useSearch();
-  const navigate = Route.useNavigate();
   const qc = useQueryClient();
   const [sorting, setSorting] = useState<SortingState>([
     { id: "timestamp", desc: true },
   ]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [accountIds, setAccountIds] = useState<number[]>([]);
+  const [categoryIds, setCategoryIds] = useState<number[]>([]);
+  const [q, setQ] = useState("");
 
   const accounts = useQuery({
     queryKey: ["accounts"],
@@ -71,18 +59,21 @@ function TransactionsPage() {
       api.get<{ openrouter_configured: boolean }>("/api/ai/settings"),
   });
 
-  const qs = new URLSearchParams();
-  if (search.account_ids) qs.set("account_ids", search.account_ids);
-  if (search.category_ids) qs.set("category_ids", search.category_ids);
-  if (search.q) qs.set("q", search.q);
-  if (search.from) qs.set("from", String(search.from));
-  if (search.to) qs.set("to", String(search.to));
-  qs.set("limit", "500");
+  const qs = useMemo(() => {
+    const p = new URLSearchParams();
+    if (accountIds.length) p.set("account_ids", accountIds.join(","));
+    if (categoryIds.length) p.set("category_ids", categoryIds.join(","));
+    const trimmed = q.trim();
+    if (trimmed) p.set("q", trimmed);
+    p.set("limit", "500");
+    return p.toString();
+  }, [accountIds, categoryIds, q]);
 
   const txns = useQuery({
-    queryKey: ["transactions", qs.toString()],
+    queryKey: ["transactions", qs],
     queryFn: () =>
       api.get<TransactionsListResponse>(`/api/transactions?${qs}`),
+    placeholderData: (prev) => prev,
   });
 
   const cmap = useMemo(() => {
@@ -129,6 +120,18 @@ function TransactionsPage() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["transactions"] }),
   });
 
+  // Keep mutate fns in refs so column defs stay referentially stable. Recreating
+  // columns every render (useMutation objects are new each time) was making
+  // the virtualizer + table fight and freeze the page.
+  const setCategoryMutate = setCategory.mutate;
+  const suggestOneMutate = suggestOne.mutate;
+  const setCategoryRef = useRef(setCategoryMutate);
+  const suggestOneRef = useRef(suggestOneMutate);
+  setCategoryRef.current = setCategoryMutate;
+  suggestOneRef.current = suggestOneMutate;
+  const suggestPendingId =
+    suggestOne.isPending && suggestOne.variables != null ? suggestOne.variables : null;
+
   const columns = useMemo<ColumnDef<Transaction>[]>(
     () => [
       {
@@ -160,7 +163,11 @@ function TransactionsPage() {
         header: "Account",
         cell: (info) => {
           const a = amap.get(info.getValue<number>());
-          return <span className="text-xs text-mid">{a?.display_name || "—"}</span>;
+          return (
+            <span className="text-xs text-mid">
+              {a?.custom_display_name || a?.display_name || "—"}
+            </span>
+          );
         },
         size: 120,
       },
@@ -184,32 +191,32 @@ function TransactionsPage() {
         cell: (info) => {
           const t = info.row.original;
           const cid = info.getValue<number | null>();
-          const c = cid ? cmap.get(cid) : null;
+          const cats = categories.data?.categories ?? [];
           return (
             <div className="flex items-center gap-1.5">
               <select
                 className="text-xs bg-transparent border border-thin px-1.5 py-0.5 focus:outline-none focus:border-green"
                 value={cid ?? ""}
                 onChange={(e) =>
-                  setCategory.mutate({
+                  setCategoryRef.current({
                     id: t.id,
                     cat: e.target.value ? Number(e.target.value) : null,
                   })
                 }
               >
                 <option value="">Uncategorised</option>
-                {categories.data?.categories.map((cc) => (
+                {cats.map((cc) => (
                   <option key={cc.id} value={cc.id}>
                     {cc.name}
                   </option>
                 ))}
               </select>
-              {aiSettings.data?.openrouter_configured && !c && (
+              {aiSettings.data?.openrouter_configured && !cid && (
                 <button
                   className="btn-ghost text-[10px] !px-1.5 !py-0.5"
                   title="Ask AI to categorise"
-                  onClick={() => suggestOne.mutate(t.id)}
-                  disabled={suggestOne.isPending && suggestOne.variables === t.id}
+                  onClick={() => suggestOneRef.current(t.id)}
+                  disabled={suggestPendingId === t.id}
                 >
                   <Sparkles className="size-3 text-orange" />
                 </button>
@@ -239,7 +246,7 @@ function TransactionsPage() {
         size: 120,
       },
     ],
-    [amap, cmap, categories.data, aiSettings.data, setCategory, suggestOne]
+    [amap, categories.data, aiSettings.data, suggestPendingId]
   );
 
   const rows = txns.data?.transactions ?? [];
@@ -248,18 +255,11 @@ function TransactionsPage() {
     columns,
     state: { sorting },
     onSortingChange: setSorting,
+    getRowId: (row) => String(row.id),
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
   });
-
-  const parentRef = useRef<HTMLDivElement>(null);
-  const virt = useVirtualizer({
-    count: table.getRowModel().rows.length,
-    getScrollElement: () => parentRef.current,
-    estimateSize: () => 44,
-    overscan: 12,
-  });
+  const tableRows = table.getRowModel().rows;
 
   const selectedTxn = rows.find((t) => t.id === selectedId) ?? null;
 
@@ -294,51 +294,61 @@ function TransactionsPage() {
         </p>
       )}
 
-      {/* Filter bar */}
-      <div className="card p-3 flex flex-wrap items-center gap-2 fade-in-1">
+      {/* Filter bar — z-20 so the account/category popover paints above the table */}
+      <div className="card p-3 flex flex-wrap items-center gap-2 fade-in-1 relative z-20">
         <div className="relative flex-1 min-w-[200px] max-w-md">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-mid" />
           <input
             className="input pl-9"
             placeholder="Search description or merchant"
-            value={search.q ?? ""}
-            onChange={(e) =>
-              navigate({
-                search: (s) => ({ ...s, q: e.target.value || undefined }),
-              })
-            }
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
           />
         </div>
         <FacetSelect
           label="Account"
-          value={search.account_ids}
-          onChange={(v) =>
-            navigate({ search: (s) => ({ ...s, account_ids: v }) })
-          }
+          value={accountIds}
+          onChange={(ids) => {
+            const next = ids ?? [];
+            setAccountIds((prev) =>
+              prev.length === next.length && prev.every((id) => next.includes(id))
+                ? prev
+                : next
+            );
+          }}
           options={
             accounts.data?.accounts.map((a) => ({
-              label: a.display_name,
-              value: String(a.id),
+              label: a.custom_display_name || a.display_name,
+              value: a.id,
             })) ?? []
           }
         />
         <FacetSelect
           label="Category"
-          value={search.category_ids}
-          onChange={(v) =>
-            navigate({ search: (s) => ({ ...s, category_ids: v }) })
-          }
+          value={categoryIds}
+          onChange={(ids) => {
+            const next = ids ?? [];
+            setCategoryIds((prev) =>
+              prev.length === next.length && prev.every((id) => next.includes(id))
+                ? prev
+                : next
+            );
+          }}
           options={
             categories.data?.categories.map((c) => ({
               label: c.name,
-              value: String(c.id),
+              value: c.id,
             })) ?? []
           }
         />
-        {(search.account_ids || search.category_ids || search.q) && (
+        {(accountIds.length > 0 || categoryIds.length > 0 || q) && (
           <button
             className="btn-ghost"
-            onClick={() => navigate({ search: () => ({}) })}
+            onClick={() => {
+              setAccountIds([]);
+              setCategoryIds([]);
+              setQ("");
+            }}
           >
             <X className="size-4" /> Clear
           </button>
@@ -357,43 +367,28 @@ function TransactionsPage() {
           )}
         </div>
         <div
-          ref={parentRef}
           className="overflow-auto"
           style={{ height: "calc(100vh - 320px)" }}
         >
-          <div style={{ height: virt.getTotalSize(), position: "relative" }}>
-            {virt.getVirtualItems().map((vi) => {
-              const row = table.getRowModel().rows[vi.index];
-              return (
-                <div
-                  key={row.id}
-                  className={`grid grid-cols-[28px_100px_120px_1fr_200px_120px] gap-3 px-4 items-center border-b border-thin hover:bg-cream/60 cursor-pointer ${
-                    selectedId === row.original.id ? "bg-green/5" : ""
-                  }`}
-                  onClick={(e) => {
-                    // Don't open drawer if user clicked a control inside the row (category select, AI button)
-                    const tag = (e.target as HTMLElement).tagName;
-                    if (tag === "SELECT" || tag === "BUTTON" || tag === "OPTION") return;
-                    setSelectedId(row.original.id);
-                  }}
-                  style={{
-                    position: "absolute",
-                    top: 0,
-                    left: 0,
-                    right: 0,
-                    height: `${vi.size}px`,
-                    transform: `translateY(${vi.start}px)`,
-                  }}
-                >
-                  {row.getVisibleCells().map((cell) => (
-                    <div key={cell.id} className="text-sm truncate">
-                      {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                    </div>
-                  ))}
+          {tableRows.map((row) => (
+            <div
+              key={row.id}
+              className={`grid grid-cols-[28px_100px_120px_1fr_200px_120px] gap-3 px-4 items-center border-b border-thin hover:bg-cream/60 cursor-pointer min-h-11 ${
+                selectedId === row.original.id ? "bg-green/5" : ""
+              }`}
+              onClick={(e) => {
+                const tag = (e.target as HTMLElement).tagName;
+                if (tag === "SELECT" || tag === "BUTTON" || tag === "OPTION") return;
+                setSelectedId(row.original.id);
+              }}
+            >
+              {row.getVisibleCells().map((cell) => (
+                <div key={cell.id} className="text-sm truncate py-2">
+                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
                 </div>
-              );
-            })}
-          </div>
+              ))}
+            </div>
+          ))}
         </div>
       </div>
 
@@ -434,12 +429,9 @@ function TransactionDrawer({
   onSetNotes: (notes: string | null) => void;
 }) {
   const [notesDraft, setNotesDraft] = useState(txn.notes ?? "");
-  // Reset draft when switching to a different transaction
-  const lastTxnId = useRef(txn.id);
-  if (lastTxnId.current !== txn.id) {
-    lastTxnId.current = txn.id;
+  useEffect(() => {
     setNotesDraft(txn.notes ?? "");
-  }
+  }, [txn.id, txn.notes]);
   return (
     <>
       <div
@@ -609,43 +601,61 @@ function FacetSelect({
   options,
 }: {
   label: string;
-  value: string | undefined;
-  onChange: (v: string | undefined) => void;
-  options: { label: string; value: string }[];
+  value: number[] | undefined;
+  onChange: (v: number[] | undefined) => void;
+  options: { label: string; value: number }[];
 }) {
-  const selected = new Set((value ?? "").split(",").filter(Boolean));
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const selected = useMemo(() => new Set(value ?? []), [value]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
   return (
-    <details className="relative">
-      <summary className="btn-secondary list-none cursor-pointer">
+    <div className="relative" ref={rootRef}>
+      <button
+        type="button"
+        className="btn-secondary"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+      >
         {label}
         {selected.size > 0 && (
           <span className="pill-grey ml-1">{selected.size}</span>
         )}
-      </summary>
-      <div className="absolute z-10 mt-1 card p-2 w-56 max-h-72 overflow-y-auto">
-        {options.map((o) => (
-          <label
-            key={o.value}
-            className="flex items-center gap-2 py-1 px-1 text-sm hover:bg-cream rounded cursor-pointer"
-          >
-            <input
-              type="checkbox"
-              checked={selected.has(o.value)}
-              onChange={(e) => {
-                if (e.target.checked) selected.add(o.value);
-                else selected.delete(o.value);
-                onChange(
-                  selected.size ? Array.from(selected).join(",") : undefined
-                );
-              }}
-            />
-            <span className="truncate">{o.label}</span>
-          </label>
-        ))}
-        {options.length === 0 && (
-          <p className="text-xs text-mid p-2">None yet.</p>
-        )}
-      </div>
-    </details>
+      </button>
+      {open && (
+        <div className="absolute left-0 top-full z-50 mt-1 card p-2 w-56 max-h-72 overflow-y-auto shadow-lg">
+          {options.map((o) => (
+            <label
+              key={o.value}
+              className="flex items-center gap-2 py-1 px-1 text-sm hover:bg-cream rounded cursor-pointer"
+            >
+              <input
+                type="checkbox"
+                checked={selected.has(o.value)}
+                onChange={(e) => {
+                  const next = new Set(selected);
+                  if (e.target.checked) next.add(o.value);
+                  else next.delete(o.value);
+                  onChange(next.size ? Array.from(next) : undefined);
+                }}
+              />
+              <span className="truncate">{o.label}</span>
+            </label>
+          ))}
+          {options.length === 0 && (
+            <p className="text-xs text-mid p-2">None yet.</p>
+          )}
+        </div>
+      )}
+    </div>
   );
 }

@@ -19,7 +19,7 @@ export interface Reminder {
 
 export interface Account {
   id: number;
-  consent_id: number;
+  consent_id: number | null;
   truelayer_id: string;
   kind: "account" | "card";
   display_name: string;

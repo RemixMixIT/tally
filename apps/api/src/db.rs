@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chrono::Utc;
 use libsql::{params, Builder, Connection, Value};
+use rand::Rng;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -398,6 +399,7 @@ impl Db {
         // This is the ONLY SELECT that adds `consent_nickname` and `pending_net_cents` columns;
         // the Account mapper resolves them via the absent-tolerant path, so all other Account
         // SELECTs (which lack these columns) still map cleanly.
+        // LEFT JOIN: manual/offline accounts have consent_id IS NULL and must still appear.
         let rows = self
             .conn
             .query(
@@ -407,13 +409,63 @@ impl Db {
                      FROM transactions t WHERE t.account_id = a.id AND t.is_pending = 1)
                         AS pending_net_cents
                  FROM accounts a
-                 INNER JOIN consents c ON c.id = a.consent_id
-                 WHERE a.enabled = 1 AND c.enabled = 1
+                 LEFT JOIN consents c ON c.id = a.consent_id
+                 WHERE a.enabled = 1 AND (a.consent_id IS NULL OR c.enabled = 1)
                  ORDER BY a.kind, a.display_name",
                 (),
             )
             .await?;
         map_rows(rows).await
+    }
+
+    pub async fn get_account(&self, id: i64) -> Result<Option<Account>> {
+        let rows = self
+            .conn
+            .query("SELECT * FROM accounts WHERE id = ?1", params![id])
+            .await?;
+        map_opt(rows).await
+    }
+
+    /// Create an offline account with no TrueLayer consent. Used as a CSV-import target for
+    /// providers that don't support Open Banking.
+    pub async fn create_manual_account(
+        &self,
+        name: &str,
+        account_type: &str,
+        opening_balance_cents: Option<i64>,
+    ) -> Result<Account> {
+        let now = Utc::now().timestamp();
+        let kind = if account_type == "credit_card" {
+            "card"
+        } else {
+            "account"
+        };
+        let truelayer_id = format!("manual:{now}:{:016x}", rand::thread_rng().gen::<u64>());
+        let balance_updated_at = opening_balance_cents.map(|_| now);
+        self.conn
+            .execute(
+                "INSERT INTO accounts (
+                    consent_id, truelayer_id, kind, display_name, currency, enabled,
+                    created_at, updated_at, account_type, current_balance_cents,
+                    available_balance_cents, balance_updated_at
+                 ) VALUES (NULL, ?1, ?2, ?3, 'GBP', 1, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    truelayer_id,
+                    kind,
+                    name,
+                    now,
+                    now,
+                    account_type,
+                    opening_balance_cents,
+                    opening_balance_cents,
+                    balance_updated_at,
+                ],
+            )
+            .await?;
+        let id = self.conn.last_insert_rowid();
+        self.get_account(id)
+            .await?
+            .context("manual account disappeared after insert")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2455,5 +2507,35 @@ mod roundtrip_tests {
         let joined = db.list_all_enabled_accounts().await.unwrap();
         assert_eq!(joined.len(), 1);
         assert_eq!(joined[0].pending_net_cents, Some(200));
+        assert_eq!(joined[0].consent_id, Some(c.id));
+    }
+
+    #[tokio::test]
+    async fn create_manual_account_lists_without_consent() {
+        let db = test_db().await;
+        let a = db
+            .create_manual_account("Smile current", "current", Some(300_532))
+            .await
+            .unwrap();
+        assert_eq!(a.consent_id, None);
+        assert_eq!(a.display_name, "Smile current");
+        assert_eq!(a.kind, "account");
+        assert_eq!(a.account_type.as_deref(), Some("current"));
+        assert_eq!(a.current_balance_cents, Some(300_532));
+        assert_eq!(a.available_balance_cents, Some(300_532));
+        assert!(a.truelayer_id.starts_with("manual:"));
+
+        let card = db
+            .create_manual_account("Vanquis", "credit_card", None)
+            .await
+            .unwrap();
+        assert_eq!(card.kind, "card");
+        assert_eq!(card.account_type.as_deref(), Some("credit_card"));
+        assert_eq!(card.current_balance_cents, None);
+
+        let listed = db.list_all_enabled_accounts().await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|x| x.consent_id.is_none()));
+        assert!(listed.iter().any(|x| x.display_name == "Smile current"));
     }
 }

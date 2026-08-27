@@ -23,7 +23,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     // Authenticated JSON API.
     let api_routes = Router::new()
-        .route("/accounts", get(api::accounts::list))
+        .route("/accounts", get(api::accounts::list).post(api::accounts::create))
         .route("/accounts/{id}", patch(api::accounts::patch))
         .route("/consents/{id}/rename", patch(consents::rename))
         .route("/transactions", get(api::transactions::list))
