@@ -19,7 +19,7 @@ services:
     restart: unless-stopped
     ports:
       # Bound to localhost — put a TLS reverse proxy (Caddy/Traefik) in front for remote access.
-      - "127.0.0.1:3001:3001"
+      - "0.0.0.0:3001:3001"
     volumes:
       - tally-data:/app/data
     env_file:
