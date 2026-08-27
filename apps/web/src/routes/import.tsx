@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { api } from "@/lib/api";
 import type { Account } from "@/types/api";
@@ -16,6 +16,7 @@ type Preview = {
     amount_column: string | null;
     credit_column: string | null;
     debit_column: string | null;
+    balance_column: string | null;
   };
 };
 
@@ -35,6 +36,7 @@ function accountLabel(a: Account) {
 }
 
 function ImportCsvPage() {
+  const qc = useQueryClient();
   const accounts = useQuery({ queryKey: ["accounts"], queryFn: () => api.get<{ accounts: Account[] }>("/api/accounts") });
   const [content, setContent] = useState("");
   const [preview, setPreview] = useState<Preview | null>(null);
@@ -45,6 +47,7 @@ function ImportCsvPage() {
     amount_column: "",
     credit_column: "",
     debit_column: "",
+    balance_column: "",
     date_format: "",
   });
 
@@ -60,6 +63,7 @@ function ImportCsvPage() {
         amount_column: split ? "" : (p.suggested.amount_column ?? ""),
         credit_column: p.suggested.credit_column ?? "",
         debit_column: p.suggested.debit_column ?? "",
+        balance_column: p.suggested.balance_column ?? "",
       }));
     },
   });
@@ -73,9 +77,14 @@ function ImportCsvPage() {
         amount_column: mapping.amount_column || null,
         credit_column: mapping.credit_column || null,
         debit_column: mapping.debit_column || null,
+        balance_column: mapping.balance_column || null,
         date_format: mapping.date_format || null,
       },
     }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["accounts"] });
+      qc.invalidateQueries({ queryKey: ["txns"] });
+    },
   });
 
   const accountList = accounts.data?.accounts ?? [];
@@ -121,6 +130,7 @@ function ImportCsvPage() {
             <ColPicker headers={preview.headers} label="Amount" value={mapping.amount_column} onChange={(v) => setMapping((m) => ({ ...m, amount_column: v }))} />
             <ColPicker headers={preview.headers} label="Credit (in)" value={mapping.credit_column} onChange={(v) => setMapping((m) => ({ ...m, credit_column: v }))} />
             <ColPicker headers={preview.headers} label="Debit (out)" value={mapping.debit_column} onChange={(v) => setMapping((m) => ({ ...m, debit_column: v }))} />
+            <ColPicker headers={preview.headers} label="Balance" value={mapping.balance_column} onChange={(v) => setMapping((m) => ({ ...m, balance_column: v }))} />
             <select className="input" value={mapping.date_format} onChange={(e) => setMapping((m) => ({ ...m, date_format: e.target.value }))}>
               {DATE_FORMATS.map((f) => (
                 <option key={f.value || "auto"} value={f.value}>{f.label}</option>

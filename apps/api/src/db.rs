@@ -435,11 +435,7 @@ impl Db {
         opening_balance_cents: Option<i64>,
     ) -> Result<Account> {
         let now = Utc::now().timestamp();
-        let kind = if account_type == "credit_card" {
-            "card"
-        } else {
-            "account"
-        };
+        let kind = crate::account_types::kind_for_type(account_type);
         let truelayer_id = format!("manual:{now}:{:016x}", rand::thread_rng().gen::<u64>());
         let balance_updated_at = opening_balance_cents.map(|_| now);
         self.conn
@@ -606,6 +602,8 @@ impl Db {
     }
 
     /// One-off metadata bump separate from `upsert_account` (which would otherwise need 14 params).
+    /// If `account_type` is already a user-chosen canonical type, it is left alone so a TrueLayer
+    /// sync cannot clobber an edit made from the Banks dropdown.
     pub async fn update_account_metadata(
         &self,
         account_id: i64,
@@ -613,17 +611,55 @@ impl Db {
         card_network: Option<&str>,
         name_on_card: Option<&str>,
     ) -> Result<()> {
+        let in_list = crate::account_types::canonical_sql_in_list();
+        let sql = format!(
+            "UPDATE accounts SET
+                account_type = CASE
+                    WHEN account_type IN ({in_list}) THEN account_type
+                    ELSE COALESCE(?1, account_type)
+                END,
+                card_network = COALESCE(?2, card_network),
+                name_on_card = COALESCE(?3, name_on_card),
+                updated_at = ?4
+             WHERE id = ?5"
+        );
         self.conn
             .execute(
-                "UPDATE accounts SET
-                    account_type = COALESCE(?1, account_type),
-                    card_network = COALESCE(?2, card_network),
-                    name_on_card = COALESCE(?3, name_on_card),
-                    updated_at = ?4
-                 WHERE id = ?5",
+                sql.as_str(),
                 params![account_type, card_network, name_on_card, Utc::now().timestamp(), account_id],
             )
             .await?;
+        Ok(())
+    }
+
+    /// Set the canonical type from the Banks dropdown (linked or manual).
+    /// Manual accounts also realign `kind` (card vs account). Linked TrueLayer accounts
+    /// keep their provider kind so cash/debt signing is unchanged.
+    pub async fn set_account_type(&self, account_id: i64, account_type: &str) -> Result<()> {
+        if !crate::account_types::is_canonical(account_type) {
+            anyhow::bail!("invalid account type {account_type}");
+        }
+        let existing = self
+            .get_account(account_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown account"))?;
+        let now = Utc::now().timestamp();
+        if existing.consent_id.is_none() {
+            let kind = crate::account_types::kind_for_type(account_type);
+            self.conn
+                .execute(
+                    "UPDATE accounts SET account_type = ?1, kind = ?2, updated_at = ?3 WHERE id = ?4",
+                    params![account_type, kind, now, account_id],
+                )
+                .await?;
+        } else {
+            self.conn
+                .execute(
+                    "UPDATE accounts SET account_type = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![account_type, now, account_id],
+                )
+                .await?;
+        }
         Ok(())
     }
 
@@ -662,6 +698,42 @@ impl Db {
     }
 
     // ---------- transactions_seen ----------
+
+    /// Account-scoped CSV/manual dedup: same calendar date + amount + description.
+    /// TrueLayer imports keep using `provider_txn_id` / `transactions_seen`; this is the
+    /// fallback when a re-exported CSV hashes differently (e.g. a changed Balance column).
+    pub async fn find_matching_transaction(
+        &self,
+        account_id: i64,
+        timestamp: i64,
+        description: &str,
+        amount_cents: i64,
+        is_credit: bool,
+    ) -> Result<Option<i64>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM transactions
+                 WHERE account_id = ?1
+                   AND date(timestamp, 'unixepoch') = date(?2, 'unixepoch')
+                   AND description = ?3
+                   AND amount_cents = ?4
+                   AND is_credit = ?5
+                 LIMIT 1",
+                params![
+                    account_id,
+                    timestamp,
+                    description,
+                    amount_cents,
+                    if is_credit { 1_i64 } else { 0 },
+                ],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<i64>(0)?)),
+            None => Ok(None),
+        }
+    }
 
     pub async fn is_txn_seen(&self, account_id: i64, truelayer_txn_id: &str) -> Result<bool> {
         let mut rows = self
@@ -2537,5 +2609,91 @@ mod roundtrip_tests {
         assert_eq!(listed.len(), 2);
         assert!(listed.iter().all(|x| x.consent_id.is_none()));
         assert!(listed.iter().any(|x| x.display_name == "Smile current"));
+
+        let biz = db
+            .create_manual_account("Capital On Tap", "business_credit_card", Some(12_345))
+            .await
+            .unwrap();
+        assert_eq!(biz.kind, "card");
+        assert_eq!(biz.account_type.as_deref(), Some("business_credit_card"));
+    }
+
+    #[tokio::test]
+    async fn matching_transaction_is_account_scoped() {
+        let db = test_db().await;
+        let a1 = db.create_manual_account("Smile", "current", None).await.unwrap();
+        let a2 = db.create_manual_account("Vanquis", "credit_card", None).await.unwrap();
+        let ts = 1_787_788_800; // 2026-08-27 00:00:00 UTC
+        db.upsert_transaction(
+            a1.id, "csv:1", ts, "TESCO, HULL", 1250, "GBP", false, false,
+            None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let hit = db
+            .find_matching_transaction(a1.id, ts, "TESCO, HULL", 1250, false)
+            .await
+            .unwrap();
+        assert!(hit.is_some());
+        // Same payload on a different account is not a duplicate.
+        let miss = db
+            .find_matching_transaction(a2.id, ts, "TESCO, HULL", 1250, false)
+            .await
+            .unwrap();
+        assert!(miss.is_none());
+        // Same day, different unix time, still matches (date-level key).
+        let later = db
+            .find_matching_transaction(a1.id, ts + 3600, "TESCO, HULL", 1250, false)
+            .await
+            .unwrap();
+        assert_eq!(later, hit);
+    }
+
+    #[tokio::test]
+    async fn set_account_type_on_linked_does_not_change_kind() {
+        let db = test_db().await;
+        let c = db
+            .upsert_consent("tide", "creds", None, None, "at", "rt", 1, None, "accounts")
+            .await
+            .unwrap();
+        let a = db
+            .upsert_account(c.id, "acc", "account", "Tide Current", None, None, None, None, "GBP")
+            .await
+            .unwrap();
+        db.update_account_metadata(a.id, Some("BUSINESS_TRANSACTION"), None, None)
+            .await
+            .unwrap();
+        db.set_account_type(a.id, "business_current").await.unwrap();
+        let after = db.get_account(a.id).await.unwrap().unwrap();
+        assert_eq!(after.account_type.as_deref(), Some("business_current"));
+        assert_eq!(after.kind, "account");
+        // Subsequent provider metadata must not clobber the user type.
+        db.update_account_metadata(a.id, Some("BUSINESS_TRANSACTION"), None, None)
+            .await
+            .unwrap();
+        let still = db.get_account(a.id).await.unwrap().unwrap();
+        assert_eq!(still.account_type.as_deref(), Some("business_current"));
+    }
+
+    #[tokio::test]
+    async fn provider_type_is_updated_until_user_sets_canonical() {
+        let db = test_db().await;
+        let c = db
+            .upsert_consent("tsb", "creds", None, None, "at", "rt", 1, None, "accounts")
+            .await
+            .unwrap();
+        let a = db
+            .upsert_account(c.id, "acc", "account", "Classic Plus", None, None, None, None, "GBP")
+            .await
+            .unwrap();
+        db.update_account_metadata(a.id, Some("TRANSACTION"), None, None)
+            .await
+            .unwrap();
+        db.update_account_metadata(a.id, Some("CURRENT_ACCOUNT"), None, None)
+            .await
+            .unwrap();
+        let after = db.get_account(a.id).await.unwrap().unwrap();
+        assert_eq!(after.account_type.as_deref(), Some("CURRENT_ACCOUNT"));
     }
 }

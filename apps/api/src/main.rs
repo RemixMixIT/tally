@@ -1,6 +1,7 @@
 //! tally — self-hosted personal finance OS.
 //! Multi-bank UK Open Banking sync (TrueLayer + Plaid) → local SQLite → TanStack web UI.
 
+mod account_types;
 mod ai;
 mod auth;
 mod auth_backend;

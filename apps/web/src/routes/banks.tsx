@@ -12,6 +12,12 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { relativeTime } from "@/lib/format";
+import {
+  MANUAL_ACCOUNT_TYPES,
+  accountTypeLabel,
+  canonicalAccountType,
+  type ManualAccountType,
+} from "@/lib/account-types";
 import type { Account, Consent } from "@/types/api";
 
 export const Route = createFileRoute("/banks")({ component: BanksPage });
@@ -45,7 +51,7 @@ function BanksPage() {
 
   const [nickname, setNickname] = useState("");
   const [manualName, setManualName] = useState("");
-  const [manualType, setManualType] = useState<"current" | "savings" | "credit_card">("current");
+  const [manualType, setManualType] = useState<ManualAccountType>("current");
   const [manualOpening, setManualOpening] = useState("");
 
   const rename = useMutation({
@@ -85,6 +91,18 @@ function BanksPage() {
       setManualOpening("");
       qc.invalidateQueries({ queryKey: ["accounts"] });
     },
+  });
+
+  const setBalance = useMutation({
+    mutationFn: ({ id, current_balance }: { id: number; current_balance: number }) =>
+      api.patch(`/api/accounts/${id}`, { current_balance }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["accounts"] }),
+  });
+
+  const setAccountType = useMutation({
+    mutationFn: ({ id, account_type }: { id: number; account_type: ManualAccountType }) =>
+      api.patch(`/api/accounts/${id}`, { account_type }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["accounts"] }),
   });
 
   const allAccounts = accounts.data?.accounts ?? [];
@@ -185,13 +203,13 @@ function BanksPage() {
           <select
             className="input"
             value={manualType}
-            onChange={(e) =>
-              setManualType(e.target.value as "current" | "savings" | "credit_card")
-            }
+            onChange={(e) => setManualType(e.target.value as ManualAccountType)}
           >
-            <option value="current">Current</option>
-            <option value="savings">Savings</option>
-            <option value="credit_card">Credit card</option>
+            {MANUAL_ACCOUNT_TYPES.map((t) => (
+              <option key={t.value} value={t.value}>
+                {t.label}
+              </option>
+            ))}
           </select>
           <input
             className="input"
@@ -227,6 +245,12 @@ function BanksPage() {
                   key={a.id}
                   account={a}
                   onRename={(name) => renameAccount.mutate({ id: a.id, name })}
+                  onSetType={(account_type) =>
+                    setAccountType.mutate({ id: a.id, account_type })
+                  }
+                  onSetBalance={(current_balance) =>
+                    setBalance.mutate({ id: a.id, current_balance })
+                  }
                 />
               ))}
             </ul>
@@ -257,6 +281,9 @@ function BanksPage() {
                 onRenameAccount={(id, name) =>
                   renameAccount.mutate({ id, name })
                 }
+                onSetAccountType={(id, account_type) =>
+                  setAccountType.mutate({ id, account_type })
+                }
                 onSync={() => syncConsent.mutate(c.id)}
                 onRemove={() => removeConsent.mutate(c.id)}
                 syncing={syncConsent.isPending && syncConsent.variables === c.id}
@@ -274,6 +301,7 @@ function BankCard({
   accounts,
   onRename,
   onRenameAccount,
+  onSetAccountType,
   onSync,
   onRemove,
   syncing,
@@ -282,6 +310,7 @@ function BankCard({
   accounts: Account[];
   onRename: (newNickname: string) => void;
   onRenameAccount: (accountId: number, newName: string | null) => void;
+  onSetAccountType: (accountId: number, accountType: ManualAccountType) => void;
   onSync: () => void;
   onRemove: () => void;
   syncing: boolean;
@@ -370,6 +399,7 @@ function BankCard({
               key={a.id}
               account={a}
               onRename={(name) => onRenameAccount(a.id, name)}
+              onSetType={(account_type) => onSetAccountType(a.id, account_type)}
             />
           ))}
         </ul>
@@ -414,15 +444,30 @@ function BankCard({
 function AccountRow({
   account,
   onRename,
+  onSetType,
+  onSetBalance,
 }: {
   account: Account;
   onRename: (name: string | null) => void;
+  onSetType: (type: ManualAccountType) => void;
+  onSetBalance?: (pounds: number) => void;
 }) {
   const [editing, setEditing] = useState(false);
+  const [editingBalance, setEditingBalance] = useState(false);
   const [draft, setDraft] = useState(
     account.custom_display_name ?? account.display_name
   );
+  const [balanceDraft, setBalanceDraft] = useState(
+    account.current_balance_cents != null
+      ? (account.current_balance_cents / 100).toString()
+      : ""
+  );
   const displayed = account.custom_display_name ?? account.display_name;
+  const typeValue = canonicalAccountType(account.account_type) ?? "";
+  const unmappedTypeLabel =
+    !typeValue && account.account_type
+      ? accountTypeLabel(account.account_type)
+      : null;
   const balance =
     account.current_balance_cents != null
       ? `${(account.current_balance_cents / 100).toLocaleString("en-GB", {
@@ -469,11 +514,26 @@ function AccountRow({
         ) : (
           <div className="flex items-center gap-2 min-w-0">
             <span className="text-sm font-semibold truncate">{displayed}</span>
-            {account.account_type && (
-              <span className="pill-grey text-[10px]">
-                {account.account_type.replace(/_/g, " ").toLowerCase()}
-              </span>
-            )}
+            <select
+              className="input text-[10px] py-0.5 px-1.5 w-auto max-w-[11rem] shrink-0"
+              value={typeValue}
+              aria-label="Account type"
+              onChange={(e) => {
+                const v = e.target.value as ManualAccountType;
+                if (v) onSetType(v);
+              }}
+            >
+              {!typeValue && (
+                <option value="">
+                  {unmappedTypeLabel ?? "Type"}
+                </option>
+              )}
+              {MANUAL_ACCOUNT_TYPES.map((t) => (
+                <option key={t.value} value={t.value}>
+                  {t.label}
+                </option>
+              ))}
+            </select>
             {account.card_network && (
               <span className="pill-grey text-[10px]">
                 {account.card_network}
@@ -495,23 +555,81 @@ function AccountRow({
         </p>
       </div>
       <div className="text-right shrink-0">
-        <p
-          className={`text-sm font-extrabold mono ${
-            isOverdrawn ? "text-danger" : "text-ink"
-          }`}
-        >
-          {balance}
-        </p>
-        {account.available_balance_cents != null &&
-          account.available_balance_cents !== account.current_balance_cents && (
-            <p className="text-[10px] mono text-mid">
-              {(account.available_balance_cents / 100).toLocaleString("en-GB", {
-                style: "currency",
-                currency: account.currency || "GBP",
-              })}{" "}
-              avail
+        {editingBalance && onSetBalance ? (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              const n = Number(balanceDraft.trim());
+              if (balanceDraft.trim() === "" || !Number.isFinite(n)) return;
+              onSetBalance(n);
+              setEditingBalance(false);
+            }}
+            className="flex gap-2 items-center"
+          >
+            <input
+              className="input w-28 text-sm text-right mono"
+              autoFocus
+              inputMode="decimal"
+              value={balanceDraft}
+              onChange={(e) => setBalanceDraft(e.target.value)}
+              aria-label="Account balance"
+            />
+            <button className="btn-primary text-xs py-1" type="submit">
+              Save
+            </button>
+            <button
+              type="button"
+              className="btn-ghost text-xs py-1"
+              onClick={() => {
+                setBalanceDraft(
+                  account.current_balance_cents != null
+                    ? (account.current_balance_cents / 100).toString()
+                    : ""
+                );
+                setEditingBalance(false);
+              }}
+            >
+              Cancel
+            </button>
+          </form>
+        ) : (
+          <>
+            <p
+              className={`text-sm font-extrabold mono ${
+                isOverdrawn ? "text-danger" : "text-ink"
+              } inline-flex items-center gap-1`}
+            >
+              {balance}
+              {onSetBalance && (
+                <button
+                  type="button"
+                  className="btn-ghost p-0.5"
+                  onClick={() => {
+                    setBalanceDraft(
+                      account.current_balance_cents != null
+                        ? (account.current_balance_cents / 100).toString()
+                        : ""
+                    );
+                    setEditingBalance(true);
+                  }}
+                  aria-label="Edit balance"
+                >
+                  <Pencil className="size-3" />
+                </button>
+              )}
             </p>
-          )}
+            {account.available_balance_cents != null &&
+              account.available_balance_cents !== account.current_balance_cents && (
+                <p className="text-[10px] mono text-mid">
+                  {(account.available_balance_cents / 100).toLocaleString("en-GB", {
+                    style: "currency",
+                    currency: account.currency || "GBP",
+                  })}{" "}
+                  avail
+                </p>
+              )}
+          </>
+        )}
       </div>
     </li>
   );

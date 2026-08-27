@@ -4,7 +4,13 @@
 //!   1. POST /api/csv/preview  — upload raw CSV bytes; server detects columns, returns suggested mapping
 //!   2. POST /api/csv/commit   — apply mapping + account selection, batch-insert transactions
 //!
-//! Dedup: `provider_txn_id` is set to `csv:<sha256-of-row>` so re-uploads are idempotent.
+//! Dedup (account-scoped): skip a row if this account already has a transaction with the same
+//! calendar date + amount + description. The row-hash `provider_txn_id` (`csv:<account>:<sha256>`)
+//! is an additional fast path for exact re-uploads, but overlapping exports often differ in a
+//! Balance column so the composite key is the source of truth.
+//!
+//! Offline accounts: if a Balance column is mapped, `current_balance_cents` is set from the
+//! chronologically latest row. Linked TrueLayer accounts are left untouched.
 //! Parser is RFC 4180 (quoted fields, doubled quotes, commas inside quotes are not delimiters).
 
 use crate::AppState;
@@ -102,6 +108,10 @@ pub struct CommitMapping {
     /// Date format string (chrono syntax), e.g. "%d/%m/%Y" for Nationwide.
     /// Defaults try ISO 8601 (`%Y-%m-%d`), then DD/MM/YYYY, then MM/DD/YYYY.
     pub date_format: Option<String>,
+    /// Optional running-balance column (e.g. Smile's "Balance"). Used to snapshot
+    /// the offline account's current balance from the latest imported row.
+    #[serde(default)]
+    pub balance_column: Option<String>,
 }
 
 fn nonempty(s: &Option<String>) -> Option<&str> {
@@ -112,15 +122,23 @@ pub async fn commit(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CommitBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    if state
-        .db
+    let (imported, skipped, errors) = commit_csv(&state.db, &body).await?;
+    Ok(Json(json!({
+        "imported": imported,
+        "skipped": skipped,
+        "errors": errors,
+    })))
+}
+
+async fn commit_csv(
+    db: &crate::db::Db,
+    body: &CommitBody,
+) -> Result<(i64, i64, Vec<String>), (StatusCode, String)> {
+    let account = db
         .get_account(body.account_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
-        .is_none()
-    {
-        return Err((StatusCode::BAD_REQUEST, "unknown account".into()));
-    }
+        .ok_or((StatusCode::BAD_REQUEST, "unknown account".into()))?;
 
     let (headers, rows) = read_table(&body.content)?;
 
@@ -135,6 +153,7 @@ pub async fn commit(
     let amount_i = nonempty(&body.mapping.amount_column).map(idx).transpose()?;
     let credit_i = nonempty(&body.mapping.credit_column).map(idx).transpose()?;
     let debit_i = nonempty(&body.mapping.debit_column).map(idx).transpose()?;
+    let balance_i = nonempty(&body.mapping.balance_column).map(idx).transpose()?;
 
     if amount_i.is_none() && credit_i.is_none() && debit_i.is_none() {
         return Err((
@@ -143,10 +162,14 @@ pub async fn commit(
         ));
     }
 
-    let currency = body.currency.unwrap_or_else(|| "GBP".to_string());
+    let date_fmt = nonempty(&body.mapping.date_format);
+    let newest_first = csv_is_newest_first(&rows, date_i, date_fmt);
+    let currency = body.currency.clone().unwrap_or_else(|| "GBP".to_string());
     let mut imported = 0i64;
     let mut skipped = 0i64;
     let mut errors: Vec<String> = Vec::new();
+    // (timestamp, row_index, balance_cents) of the chronologically latest row with a balance.
+    let mut latest_balance: Option<(i64, usize, i64)> = None;
 
     for (row_n, rec) in rows.iter().enumerate() {
         let cell = |i: usize| rec.get(i).map(|s| s.as_str()).unwrap_or("");
@@ -157,11 +180,27 @@ pub async fn commit(
 
         let date_str = cell(date_i).trim();
         let desc = cell(desc_i).trim().to_string();
-        let ts = parse_date(date_str, nonempty(&body.mapping.date_format));
+        let ts = parse_date(date_str, date_fmt);
         let Some(ts) = ts else {
             errors.push(format!("row {row_n}: couldn't parse date '{date_str}'"));
             continue;
         };
+
+        if let Some(bi) = balance_i {
+            let raw_bal = cell(bi);
+            if !raw_bal.trim().is_empty() {
+                let cents = (parse_money(raw_bal) * 100.0).round() as i64;
+                let take = match latest_balance {
+                    None => true,
+                    Some((best_ts, best_n, _)) => {
+                        prefer_balance_row(ts, row_n, best_ts, best_n, newest_first)
+                    }
+                };
+                if take {
+                    latest_balance = Some((ts, row_n, cents));
+                }
+            }
+        }
 
         // Prefer split Credit/Debit when those columns are mapped — even if an amount
         // column was also selected — so Smile-style Money In / Money Out CSVs work.
@@ -179,13 +218,23 @@ pub async fn commit(
             continue;
         };
 
-        if state.db.is_txn_seen(body.account_id, &hash).await.unwrap_or(false) {
+        if db.is_txn_seen(body.account_id, &hash).await.unwrap_or(false) {
             skipped += 1;
             continue;
         }
 
-        let new_id = match state
-            .db
+        if let Ok(Some(existing_id)) = db
+            .find_matching_transaction(body.account_id, ts, &desc, amount_cents, is_credit)
+            .await
+        {
+            let _ = db
+                .record_txn_imported(body.account_id, &hash, Some(existing_id), false, None)
+                .await;
+            skipped += 1;
+            continue;
+        }
+
+        let new_id = match db
             .upsert_transaction(
                 body.account_id,
                 &hash,
@@ -210,18 +259,70 @@ pub async fn commit(
                 continue;
             }
         };
-        let _ = state
-            .db
+        let _ = db
             .record_txn_imported(body.account_id, &hash, Some(new_id), false, None)
             .await;
         imported += 1;
     }
 
-    Ok(Json(json!({
-        "imported": imported,
-        "skipped": skipped,
-        "errors": errors,
-    })))
+    // Snapshot the latest CSV running balance onto manual/offline accounts only.
+    if account.consent_id.is_none() {
+        if let Some((_, _, cents)) = latest_balance {
+            if let Err(e) = db
+                .update_account_balance(account.id, cents, Some(cents), None)
+                .await
+            {
+                errors.push(format!("could not update account balance: {e:#}"));
+            }
+        }
+    }
+
+    tracing::info!(
+        account_id = body.account_id,
+        imported,
+        skipped,
+        "csv import finished"
+    );
+
+    Ok((imported, skipped, errors))
+}
+
+/// True when the file's dates go newest → oldest (typical UK bank export).
+fn csv_is_newest_first(rows: &[Vec<String>], date_i: usize, date_fmt: Option<&str>) -> bool {
+    let mut prev: Option<i64> = None;
+    for rec in rows {
+        let date_str = rec.get(date_i).map(|s| s.as_str()).unwrap_or("");
+        let Some(ts) = parse_date(date_str, date_fmt) else {
+            continue;
+        };
+        if let Some(p) = prev {
+            if ts != p {
+                return ts < p;
+            }
+        }
+        prev = Some(ts);
+    }
+    true
+}
+
+fn prefer_balance_row(
+    candidate_ts: i64,
+    candidate_row: usize,
+    best_ts: i64,
+    best_row: usize,
+    newest_first: bool,
+) -> bool {
+    if candidate_ts > best_ts {
+        return true;
+    }
+    if candidate_ts < best_ts {
+        return false;
+    }
+    if newest_first {
+        candidate_row < best_row
+    } else {
+        candidate_row > best_row
+    }
 }
 
 /// Empty / whitespace / unparseable money strings are treated as zero.
@@ -347,6 +448,7 @@ mod tests {
         assert_eq!(s.credit_column.as_deref(), Some("Money In"));
         assert_eq!(s.debit_column.as_deref(), Some("Money Out"));
         assert_eq!(s.amount_column, None, "split credit/debit must not also suggest Amount");
+        assert_eq!(s.balance_column.as_deref(), Some("Balance"));
     }
 
     #[test]
@@ -399,5 +501,184 @@ mod tests {
         assert_eq!(mapped[2].1, "TESCO, HULL");
         assert!(!mapped[2].2);
         assert_eq!(mapped[2].3, 1250);
+    }
+
+    fn smile_mapping() -> CommitMapping {
+        CommitMapping {
+            date_column: "Date".into(),
+            description_column: "Description".into(),
+            amount_column: None,
+            credit_column: Some("Money In".into()),
+            debit_column: Some("Money Out".into()),
+            date_format: Some("%Y-%m-%d".into()),
+            balance_column: Some("Balance".into()),
+        }
+    }
+
+    async fn test_db() -> crate::db::Db {
+        use crate::crypto::Crypto;
+        use base64::engine::general_purpose::STANDARD as B64STD;
+        use base64::Engine;
+        let crypto = Crypto::from_b64(&B64STD.encode([9u8; 32])).unwrap();
+        let database = libsql::Builder::new_local(":memory:").build().await.unwrap();
+        let conn = database.connect().unwrap();
+        crate::migrate::run(&conn).await.unwrap();
+        crate::db::Db {
+            conn: std::sync::Arc::new(conn),
+            crypto,
+        }
+    }
+
+    #[tokio::test]
+    async fn smile_import_sets_balance_and_skips_overlapping_reimport() {
+        let db = test_db().await;
+        let acct = db
+            .create_manual_account("Smile", "current", None)
+            .await
+            .unwrap();
+        let body = CommitBody {
+            content: SMILE.to_string(),
+            account_id: acct.id,
+            mapping: smile_mapping(),
+            currency: None,
+        };
+        let (imported, skipped, errors) = commit_csv(&db, &body).await.unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(imported, 3);
+        assert_eq!(skipped, 0);
+        let after = db.get_account(acct.id).await.unwrap().unwrap();
+        assert_eq!(after.current_balance_cents, Some(300_532));
+
+        // Same file again — hash + composite key both skip.
+        let (imported2, skipped2, errors2) = commit_csv(&db, &body).await.unwrap();
+        assert!(errors2.is_empty(), "{errors2:?}");
+        assert_eq!(imported2, 0);
+        assert_eq!(skipped2, 3);
+    }
+
+    #[tokio::test]
+    async fn overlapping_csv_with_changed_balance_is_semantic_dedup() {
+        let db = test_db().await;
+        let acct = db
+            .create_manual_account("Smile", "current", None)
+            .await
+            .unwrap();
+        let first = CommitBody {
+            content: SMILE.to_string(),
+            account_id: acct.id,
+            mapping: smile_mapping(),
+            currency: None,
+        };
+        commit_csv(&db, &first).await.unwrap();
+
+        // Overlapping export: same date/amount/description, different Balance (so row hash differs).
+        let overlapping = r#""Date","Description","Type","Money In","Money Out","Balance"
+"2026-08-28","NEW SHOP","POS","","3.00","2999.99"
+"2026-08-27","John Lancaster","CREDIT","2500.00","","3002.99"
+"2026-08-24","KCOM GROUP LTD","DD","","40.99","502.99"
+"#;
+        let second = CommitBody {
+            content: overlapping.to_string(),
+            account_id: acct.id,
+            mapping: smile_mapping(),
+            currency: None,
+        };
+        let (imported, skipped, errors) = commit_csv(&db, &second).await.unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(imported, 1, "only the new 28 Aug row should insert");
+        assert_eq!(skipped, 2);
+        let after = db.get_account(acct.id).await.unwrap().unwrap();
+        // Latest date in the overlapping file is 28 Aug with running balance 2999.99.
+        assert_eq!(after.current_balance_cents, Some(299_999));
+    }
+
+    #[tokio::test]
+    async fn same_txn_on_two_accounts_is_not_a_duplicate() {
+        let db = test_db().await;
+        let a1 = db.create_manual_account("Smile", "current", None).await.unwrap();
+        let a2 = db.create_manual_account("Vanquis", "credit_card", None).await.unwrap();
+        let m = smile_mapping();
+        let (i1, _, e1) = commit_csv(
+            &db,
+            &CommitBody {
+                content: SMILE.to_string(),
+                account_id: a1.id,
+                mapping: smile_mapping(),
+                currency: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (i2, s2, e2) = commit_csv(
+            &db,
+            &CommitBody {
+                content: SMILE.to_string(),
+                account_id: a2.id,
+                mapping: m,
+                currency: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(e1.is_empty() && e2.is_empty());
+        assert_eq!(i1, 3);
+        assert_eq!(i2, 3);
+        assert_eq!(s2, 0);
+    }
+
+    #[tokio::test]
+    async fn csv_without_balance_does_not_clear_opening_balance() {
+        let db = test_db().await;
+        let acct = db
+            .create_manual_account("Vanquis", "credit_card", Some(50_000))
+            .await
+            .unwrap();
+        let csv = r#""Date","Description","Amount"
+"2026-08-01","PAYMENT","-10.00"
+"#;
+        let body = CommitBody {
+            content: csv.to_string(),
+            account_id: acct.id,
+            mapping: CommitMapping {
+                date_column: "Date".into(),
+                description_column: "Description".into(),
+                amount_column: Some("Amount".into()),
+                credit_column: None,
+                debit_column: None,
+                date_format: Some("%Y-%m-%d".into()),
+                balance_column: None,
+            },
+            currency: None,
+        };
+        let (imported, _, errors) = commit_csv(&db, &body).await.unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(imported, 1);
+        let after = db.get_account(acct.id).await.unwrap().unwrap();
+        assert_eq!(after.current_balance_cents, Some(50_000));
+    }
+
+    #[tokio::test]
+    async fn linked_account_balance_is_not_overwritten_by_csv() {
+        let db = test_db().await;
+        let consent = db
+            .upsert_consent("bank", "creds", None, None, "at", "rt", 1, None, "accounts")
+            .await
+            .unwrap();
+        let acct = db
+            .upsert_account(consent.id, "acc-1", "account", "Current", None, None, None, None, "GBP")
+            .await
+            .unwrap();
+        db.update_account_balance(acct.id, 99_000, Some(99_000), None)
+            .await
+            .unwrap();
+        let body = CommitBody {
+            content: SMILE.to_string(),
+            account_id: acct.id,
+            mapping: smile_mapping(),
+            currency: None,
+        };
+        commit_csv(&db, &body).await.unwrap();
+        let after = db.get_account(acct.id).await.unwrap().unwrap();
+        assert_eq!(after.current_balance_cents, Some(99_000));
     }
 }

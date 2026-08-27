@@ -2,6 +2,7 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { formatMoney, relativeTime } from "@/lib/format";
+import { accountTypeLabel } from "@/lib/account-types";
 import type { Consent } from "@/types/api";
 import { PortfolioChart } from "@/components/PortfolioChart";
 import {
@@ -346,20 +347,9 @@ function Dashboard() {
                   headlineCents != null &&
                   (isCard ? headlineCents > 0 : headlineCents < 0);
                 const showLast4 = a.card_last4 && a.card_last4 !== "null";
-                // Friendly type label. TrueLayer's raw account_type "TRANSACTION" means a
-                // current account; cards from the /cards endpoint are credit cards.
-                const typeLabel = isCard
-                  ? "Credit card"
-                  : a.account_type === "TRANSACTION"
-                    ? "Current account"
-                    : a.account_type === "SAVINGS"
-                      ? "Savings"
-                      : a.account_type
-                        ? a.account_type
-                            .replace(/_/g, " ")
-                            .toLowerCase()
-                            .replace(/^./, (c) => c.toUpperCase())
-                        : "Account";
+                // Friendly type label. TrueLayer TRANSACTION/SAVINGS/CARD plus manual types.
+                const typeLabel =
+                  accountTypeLabel(a.account_type) ?? (isCard ? "Credit card" : "Account");
                 return (
                   <div
                     key={a.id}
