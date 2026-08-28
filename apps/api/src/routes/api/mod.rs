@@ -6,6 +6,7 @@ pub mod bills;
 pub mod budgets;
 pub mod categories;
 pub mod csv_import;
+pub mod finance;
 pub mod holdings;
 pub mod reminders;
 pub mod routine;

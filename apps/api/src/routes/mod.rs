@@ -9,7 +9,7 @@ pub mod oauth;
 
 use crate::AppState;
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use std::sync::Arc;
 use tower_http::services::ServeDir;
@@ -116,6 +116,53 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/activities/{id}",
             patch(api::holdings::update_activity).delete(api::holdings::delete_activity),
+        )
+        // Manual assets/liabilities (0014). Distinct from /holdings (broker/Yahoo).
+        .route(
+            "/financial-items",
+            get(api::finance::list_items).post(api::finance::create_item),
+        )
+        .route(
+            "/financial-items/{id}",
+            get(api::finance::get_item)
+                .put(api::finance::update_item)
+                .delete(api::finance::delete_item),
+        )
+        .route(
+            "/financial-items/{id}/valuations",
+            get(api::finance::list_valuations).post(api::finance::create_valuation),
+        )
+        .route("/valuations/{id}", put(api::finance::update_valuation))
+        .route(
+            "/financial-items/{id}/holdings",
+            get(api::finance::list_item_holdings).post(api::finance::create_item_holding),
+        )
+        .route(
+            "/item-holdings/{id}",
+            put(api::finance::update_item_holding).delete(api::finance::delete_item_holding),
+        )
+        .route(
+            "/properties/{id}",
+            get(api::finance::get_property).put(api::finance::put_property),
+        )
+        .route(
+            "/mortgages/{id}",
+            get(api::finance::get_mortgage).put(api::finance::put_mortgage),
+        )
+        .route("/receivables/{id}", put(api::finance::put_receivable))
+        .route(
+            "/forecasts",
+            get(api::finance::list_forecasts).post(api::finance::create_forecast),
+        )
+        .route(
+            "/forecasts/{id}",
+            put(api::finance::update_forecast).delete(api::finance::delete_forecast),
+        )
+        .route("/net-worth", get(api::finance::net_worth))
+        .route("/net-worth/history", get(api::finance::net_worth_history))
+        .route(
+            "/net-worth/explanation",
+            get(api::finance::net_worth_explanation),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

@@ -12,6 +12,9 @@ assistants can read your finances in near real-time, and built-in 2FA.
 - Stores every transaction locally in SQLite, not just references.
 - Rules engine (regex to category), budgets, bills, and search/aggregate APIs.
 - Tracks investment holdings and net worth.
+- Manual assets and liabilities with dated valuation snapshots, SIPP holdings, property,
+  mortgages, tax, receivables, and conservative/base/optimistic forecasts (forecasts never
+  mix into actual net worth).
 - Custom recurring reminders and checklists (e.g. Help to Save, card due dates) with Telegram
   alerts, shown alongside your auto-detected direct debits.
 - Exposes an MCP server so Claude, ChatGPT, and similar clients can query your data and read or
@@ -200,6 +203,31 @@ Reminders are recurring checklist items (hourly, daily, weekly, or monthly on a 
 month). tally pings you on Telegram when one is due and not ticked, then rolls it to the next
 period. The screen also shows your auto-detected direct debits, so it is one place for everything
 you owe or need to do.
+
+## Manual assets, valuations, and net worth
+
+Migration `0014` adds tables for items that are not bank feeds: `financial_items`,
+`valuation_snapshots`, `investment_holdings` (SIPP-style holdings; distinct from broker
+`holdings`), `property_details`, `mortgage_details`, `tax_liability_details`,
+`receivable_details`, and `forecast_scenarios`.
+
+New valuations always insert a snapshot. The latest date is the current value. Net worth is
+assets minus liabilities: valuation items plus enabled bank/manual account balances and the
+broker/Yahoo portfolio. Roll-up parents with holdings count the holdings, not a second parent
+total; property is an asset and its mortgage is a liability counted once; forecasts, inactive
+items, and transactions are excluded. Bank and broker figures are latest balances, not
+historical reconstructions. `GET /api/net-worth` and `GET /api/net-worth/explanation` return
+counted, excluded, and unreconciled lines.
+
+The existing `/api/holdings` broker/Yahoo API is unchanged. Item-level holdings are nested under
+`/api/financial-items/:id/holdings` and updated via `/api/item-holdings/:id` so they cannot
+collide with broker holding deletes.
+
+Rollback of 0014 is unsupported (same as every prior tally migration). Restore a pre-0014
+SQLite backup if you need to undo.
+
+UI: **Assets** (`/valuations` — not `/assets`, which is the SPA JS bundle folder),
+**Net worth**, property and mortgage detail pages, and **Forecasts**.
 
 ## Build from source
 

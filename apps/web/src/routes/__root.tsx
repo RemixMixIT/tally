@@ -13,7 +13,6 @@ import {
   LayoutDashboard,
   ReceiptText,
   FolderTree,
-  Wand2,
   Wallet,
   CalendarClock,
   Landmark,
@@ -22,6 +21,9 @@ import {
   LogOut,
   LineChart,
   AlarmClock,
+  Scale,
+  PieChart,
+  Sparkles,
 } from "lucide-react";
 
 export const Route = createRootRouteWithContext<{
@@ -112,6 +114,15 @@ function RootLayout() {
           </NavItem>
           <NavItem to="/investments" icon={<LineChart className="size-[18px]" />}>
             Investments
+          </NavItem>
+          <NavItem to="/valuations" icon={<Scale className="size-[18px]" />}>
+            Assets
+          </NavItem>
+          <NavItem to="/net-worth" icon={<PieChart className="size-[18px]" />}>
+            Net worth
+          </NavItem>
+          <NavItem to="/forecasts" icon={<Sparkles className="size-[18px]" />}>
+            Forecasts
           </NavItem>
           <NavItem to="/import" icon={<Upload className="size-[18px]" />}>
             Import CSV

@@ -1,3 +1,11 @@
+/** Format a major-unit amount (pounds, not cents) in the given currency. */
+export function formatGbp(amount: number, currency: string = "GBP"): string {
+  return new Intl.NumberFormat("en-GB", {
+    style: "currency",
+    currency,
+  }).format(amount);
+}
+
 export function formatMoney(cents: number, currency: string = "GBP"): string {
   const n = cents / 100;
   return new Intl.NumberFormat("en-GB", {

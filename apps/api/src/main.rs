@@ -8,6 +8,8 @@ mod auth_backend;
 mod clients;
 mod crypto;
 mod db;
+mod finance;
+mod finance_store;
 mod importer;
 mod middleware;
 mod migrate;

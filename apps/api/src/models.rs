@@ -649,6 +649,306 @@ impl FromLibsqlRow for Bill {
     }
 }
 
+// ----- finance valuation model (migration 0014) -----
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FinancialItem {
+    pub id: i64,
+    pub name: String,
+    pub class: String,
+    pub item_type: String,
+    pub owner_entity: String,
+    pub provider: Option<String>,
+    pub reference: Option<String>,
+    pub parent_item_id: Option<i64>,
+    pub currency: String,
+    pub is_asset: i64,
+    pub is_liability: i64,
+    pub is_rollup: i64,
+    pub is_active: i64,
+    pub notes: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl FromLibsqlRow for FinancialItem {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            name: col!(c, row, "name"),
+            class: col!(c, row, "class"),
+            item_type: col!(c, row, "item_type"),
+            owner_entity: col!(c, row, "owner_entity"),
+            provider: col!(c, row, "provider"),
+            reference: col!(c, row, "reference"),
+            parent_item_id: col!(c, row, "parent_item_id"),
+            currency: col!(c, row, "currency"),
+            is_asset: col!(c, row, "is_asset"),
+            is_liability: col!(c, row, "is_liability"),
+            is_rollup: col!(c, row, "is_rollup"),
+            is_active: col!(c, row, "is_active"),
+            notes: col!(c, row, "notes"),
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ValuationSnapshot {
+    pub id: i64,
+    pub financial_item_id: i64,
+    pub valuation_date: String,
+    pub native_value: f64,
+    pub currency: String,
+    pub gbp_value: f64,
+    pub fx_rate: Option<f64>,
+    pub fx_rate_date: Option<String>,
+    pub source_type: String,
+    pub source_reference: Option<String>,
+    pub confidence: String,
+    pub contributions: Option<f64>,
+    pub withdrawals: Option<f64>,
+    pub notes: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl FromLibsqlRow for ValuationSnapshot {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            financial_item_id: col!(c, row, "financial_item_id"),
+            valuation_date: col!(c, row, "valuation_date"),
+            native_value: col!(c, row, "native_value"),
+            currency: col!(c, row, "currency"),
+            gbp_value: col!(c, row, "gbp_value"),
+            fx_rate: col!(c, row, "fx_rate"),
+            fx_rate_date: col!(c, row, "fx_rate_date"),
+            source_type: col!(c, row, "source_type"),
+            source_reference: col!(c, row, "source_reference"),
+            confidence: col!(c, row, "confidence"),
+            contributions: col!(c, row, "contributions"),
+            withdrawals: col!(c, row, "withdrawals"),
+            notes: col!(c, row, "notes"),
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InvestmentHolding {
+    pub id: i64,
+    pub financial_item_id: i64,
+    pub holding_name: String,
+    pub ticker_or_identifier: Option<String>,
+    pub units: Option<f64>,
+    pub price: Option<f64>,
+    pub price_currency: Option<String>,
+    pub cost_basis: Option<f64>,
+    pub target_allocation: Option<f64>,
+    pub target_return: Option<f64>,
+    pub valuation_date: String,
+    pub native_value: f64,
+    pub currency: String,
+    pub gbp_value: f64,
+    pub source_reference: Option<String>,
+    pub notes: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl FromLibsqlRow for InvestmentHolding {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            financial_item_id: col!(c, row, "financial_item_id"),
+            holding_name: col!(c, row, "holding_name"),
+            ticker_or_identifier: col!(c, row, "ticker_or_identifier"),
+            units: col!(c, row, "units"),
+            price: col!(c, row, "price"),
+            price_currency: col!(c, row, "price_currency"),
+            cost_basis: col!(c, row, "cost_basis"),
+            target_allocation: col!(c, row, "target_allocation"),
+            target_return: col!(c, row, "target_return"),
+            valuation_date: col!(c, row, "valuation_date"),
+            native_value: col!(c, row, "native_value"),
+            currency: col!(c, row, "currency"),
+            gbp_value: col!(c, row, "gbp_value"),
+            source_reference: col!(c, row, "source_reference"),
+            notes: col!(c, row, "notes"),
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PropertyDetails {
+    pub financial_item_id: i64,
+    pub region: String,
+    pub postcode_area: Option<String>,
+    pub valuation_method: String,
+    pub valuation_url: Option<String>,
+    pub valuation_cadence: String,
+    pub comparable_sales_notes: Option<String>,
+    pub valuation_confidence: String,
+    pub last_reviewed: Option<String>,
+}
+
+impl FromLibsqlRow for PropertyDetails {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            financial_item_id: col!(c, row, "financial_item_id"),
+            region: col!(c, row, "region"),
+            postcode_area: col!(c, row, "postcode_area"),
+            valuation_method: col!(c, row, "valuation_method"),
+            valuation_url: col!(c, row, "valuation_url"),
+            valuation_cadence: col!(c, row, "valuation_cadence"),
+            comparable_sales_notes: col!(c, row, "comparable_sales_notes"),
+            valuation_confidence: col!(c, row, "valuation_confidence"),
+            last_reviewed: col!(c, row, "last_reviewed"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MortgageDetails {
+    pub financial_item_id: i64,
+    pub property_item_id: Option<i64>,
+    pub repayment_type: String,
+    pub outstanding_balance: f64,
+    pub interest_rate: Option<f64>,
+    pub rate_type: Option<String>,
+    pub fixed_period_expiry: Option<String>,
+    pub payment_amount: Option<f64>,
+    pub payment_frequency: Option<String>,
+    pub term_end_date: Option<String>,
+    pub overpayment_total: Option<f64>,
+    pub projected_balance: Option<f64>,
+    pub notes: Option<String>,
+}
+
+impl FromLibsqlRow for MortgageDetails {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            financial_item_id: col!(c, row, "financial_item_id"),
+            property_item_id: col!(c, row, "property_item_id"),
+            repayment_type: col!(c, row, "repayment_type"),
+            outstanding_balance: col!(c, row, "outstanding_balance"),
+            interest_rate: col!(c, row, "interest_rate"),
+            rate_type: col!(c, row, "rate_type"),
+            fixed_period_expiry: col!(c, row, "fixed_period_expiry"),
+            payment_amount: col!(c, row, "payment_amount"),
+            payment_frequency: col!(c, row, "payment_frequency"),
+            term_end_date: col!(c, row, "term_end_date"),
+            overpayment_total: col!(c, row, "overpayment_total"),
+            projected_balance: col!(c, row, "projected_balance"),
+            notes: col!(c, row, "notes"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaxLiabilityDetails {
+    pub financial_item_id: i64,
+    pub tax_kind: String,
+}
+
+impl FromLibsqlRow for TaxLiabilityDetails {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            financial_item_id: col!(c, row, "financial_item_id"),
+            tax_kind: col!(c, row, "tax_kind"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReceivableDetails {
+    pub financial_item_id: i64,
+    pub debtor: String,
+    pub invoice_reference: String,
+    pub due_date: String,
+    pub expected_amount: f64,
+    pub currency: String,
+    pub gbp_value: f64,
+    pub status: String,
+}
+
+impl FromLibsqlRow for ReceivableDetails {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            financial_item_id: col!(c, row, "financial_item_id"),
+            debtor: col!(c, row, "debtor"),
+            invoice_reference: col!(c, row, "invoice_reference"),
+            due_date: col!(c, row, "due_date"),
+            expected_amount: col!(c, row, "expected_amount"),
+            currency: col!(c, row, "currency"),
+            gbp_value: col!(c, row, "gbp_value"),
+            status: col!(c, row, "status"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ForecastScenario {
+    pub id: i64,
+    pub name: String,
+    pub scenario_type: String,
+    pub financial_item_id: Option<i64>,
+    pub forecast_start: String,
+    pub forecast_end: String,
+    pub starting_gbp_value: f64,
+    pub target_return: Option<f64>,
+    pub property_growth_rate: Option<f64>,
+    pub mortgage_rate: Option<f64>,
+    pub repayment_assumption: Option<String>,
+    pub fx_assumption: Option<f64>,
+    pub contributions: Option<f64>,
+    pub withdrawals: Option<f64>,
+    pub ending_projected_value: Option<f64>,
+    pub assumptions: String,
+    pub notes: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl FromLibsqlRow for ForecastScenario {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            name: col!(c, row, "name"),
+            scenario_type: col!(c, row, "scenario_type"),
+            financial_item_id: col!(c, row, "financial_item_id"),
+            forecast_start: col!(c, row, "forecast_start"),
+            forecast_end: col!(c, row, "forecast_end"),
+            starting_gbp_value: col!(c, row, "starting_gbp_value"),
+            target_return: col!(c, row, "target_return"),
+            property_growth_rate: col!(c, row, "property_growth_rate"),
+            mortgage_rate: col!(c, row, "mortgage_rate"),
+            repayment_assumption: col!(c, row, "repayment_assumption"),
+            fx_assumption: col!(c, row, "fx_assumption"),
+            contributions: col!(c, row, "contributions"),
+            withdrawals: col!(c, row, "withdrawals"),
+            ending_projected_value: col!(c, row, "ending_projected_value"),
+            assumptions: col!(c, row, "assumptions"),
+            notes: col!(c, row, "notes"),
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+        })
+    }
+}
+
 // ----- TrueLayer DTOs -----
 
 pub mod truelayer {

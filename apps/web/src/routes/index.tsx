@@ -1,7 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
-import { formatMoney, relativeTime } from "@/lib/format";
+import { formatMoney, formatGbp, relativeTime } from "@/lib/format";
 import { accountTypeLabel } from "@/lib/account-types";
 import type { Consent } from "@/types/api";
 import { PortfolioChart } from "@/components/PortfolioChart";
@@ -68,6 +68,17 @@ function Dashboard() {
         holdings_unrealised_gain: number;
       }>("/api/holdings/net-worth"),
   });
+  const financeNetWorth = useQuery({
+    queryKey: ["net-worth"],
+    queryFn: () =>
+      api.get<{
+        net_worth: {
+          net_worth_gbp: number;
+          assets_gbp: number;
+          liabilities_gbp: number;
+        };
+      }>("/api/net-worth"),
+  });
 
   const spendSeries = useQuery({
     queryKey: ["spend-series"],
@@ -100,6 +111,7 @@ function Dashboard() {
   const cost = netWorth.data?.holdings_cost_basis ?? 0;
   const gainPct = cost > 0 ? (gain / cost) * 100 : 0;
   const portfolioPositive = gain >= 0;
+  const financeNw = financeNetWorth.data?.net_worth;
 
   // Total cash across bank + card accounts. Cards subtract (they're debt) so the figure
   // is genuine net cash position. Skip accounts without a balance snapshot yet.
@@ -270,6 +282,26 @@ function Dashboard() {
               </ResponsiveContainer>
             )}
           </div>
+        </section>
+
+        {/* Household net worth: valuations + banks + broker portfolio */}
+        <section className="card p-7 col-span-12 sm:col-span-6 lg:col-span-4">
+          <p className="text-[10px] uppercase tracking-widest text-mid mb-2">
+            Net worth
+          </p>
+          <p className="font-extrabold text-3xl mono tracking-tight">
+            {formatGbp(financeNw?.net_worth_gbp ?? 0)}
+          </p>
+          <p className="text-xs text-mid mt-1">
+            {formatGbp(financeNw?.assets_gbp ?? 0)} assets ·{" "}
+            {formatGbp(financeNw?.liabilities_gbp ?? 0)} liabilities
+          </p>
+          <Link
+            to="/net-worth"
+            className="text-sm text-green font-semibold hover:text-green-deep inline-flex items-center gap-1 mt-3"
+          >
+            Explanation <ArrowRight className="size-4" />
+          </Link>
         </section>
 
         {/* Accounts count tile */}

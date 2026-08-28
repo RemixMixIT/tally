@@ -21,7 +21,7 @@ pub struct Db {
 }
 
 /// Collect every row of a query into `Vec<T>` using the type's `FromLibsqlRow` mapper.
-async fn map_rows<T: FromLibsqlRow>(mut rows: libsql::Rows) -> Result<Vec<T>> {
+pub(crate) async fn map_rows<T: FromLibsqlRow>(mut rows: libsql::Rows) -> Result<Vec<T>> {
     let mut out = Vec::new();
     while let Some(row) = rows.next().await? {
         out.push(T::from_row(&row)?);
@@ -30,7 +30,7 @@ async fn map_rows<T: FromLibsqlRow>(mut rows: libsql::Rows) -> Result<Vec<T>> {
 }
 
 /// Map the first row of a query (if any) using `FromLibsqlRow`.
-async fn map_opt<T: FromLibsqlRow>(mut rows: libsql::Rows) -> Result<Option<T>> {
+pub(crate) async fn map_opt<T: FromLibsqlRow>(mut rows: libsql::Rows) -> Result<Option<T>> {
     match rows.next().await? {
         Some(row) => Ok(Some(T::from_row(&row)?)),
         None => Ok(None),

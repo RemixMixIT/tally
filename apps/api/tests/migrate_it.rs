@@ -18,6 +18,7 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
     (11, "watchlist", include_str!("../migrations/0011_watchlist.sql")),
     (12, "drop_watchlist", include_str!("../migrations/0012_drop_watchlist.sql")),
     (13, "manual_accounts", include_str!("../migrations/0013_manual_accounts.sql")),
+    (14, "financial_items", include_str!("../migrations/0014_financial_items.sql")),
 ];
 
 async fn run(conn: &Connection) -> anyhow::Result<()> {
@@ -71,7 +72,7 @@ async fn all_migrations_apply_under_libsql() {
     let conn = db.connect().unwrap();
 
     run(&conn).await.unwrap();
-    assert_eq!(versions(&conn).await, (1..=13).collect::<Vec<_>>());
+    assert_eq!(versions(&conn).await, (1..=14).collect::<Vec<_>>());
 
     // The real migration SQL produced real tables under libsql's dialect.
     let mut rows = conn
@@ -87,5 +88,100 @@ async fn all_migrations_apply_under_libsql() {
 
     // Idempotent re-run.
     run(&conn).await.unwrap();
-    assert_eq!(versions(&conn).await, (1..=13).collect::<Vec<_>>());
+    assert_eq!(versions(&conn).await, (1..=14).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn populated_db_keeps_existing_rows_after_0014() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    // Apply 1..=13 only, then seed like a live database, then apply 14.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (version BIGINT PRIMARY KEY, \
+         description TEXT NOT NULL, installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+         success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL);",
+    )
+    .await
+    .unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=OFF;").await.ok();
+    for (v, name, sql) in &MIGRATIONS[..13] {
+        let tx = conn.transaction().await.unwrap();
+        tx.execute_batch(sql).await.unwrap();
+        tx.execute(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES (?1, ?2, 1, ?3, 0)",
+            params![*v, *name, Vec::<u8>::new()],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    conn.execute_batch("PRAGMA foreign_keys=ON;").await.ok();
+
+    conn.execute(
+        "INSERT INTO consents (
+            nickname, credentials_id, access_token_enc, access_token_nonce,
+            refresh_token_enc, refresh_token_nonce, expires_at, scopes,
+            created_at, updated_at, enabled
+         ) VALUES ('seed-bank', 'creds', x'00', x'00', x'00', x'00', 1, 'accounts', 1, 1, 1)",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO accounts (
+            consent_id, truelayer_id, kind, display_name, currency, enabled, created_at, updated_at
+         ) VALUES (1, 'tl-seed', 'account', 'Seed current', 'GBP', 1, 1, 1)",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO transactions (
+            account_id, provider_txn_id, timestamp, description, amount_cents, currency,
+            is_credit, is_pending, created_at, updated_at
+         ) VALUES (1, 'txn-seed', 1000, 'COFFEE', 250, 'GBP', 0, 0, 1, 1)",
+        (),
+    )
+    .await
+    .unwrap();
+
+    run(&conn).await.unwrap();
+    assert_eq!(versions(&conn).await, (1..=14).collect::<Vec<_>>());
+
+    let mut rows = conn
+        .query("SELECT display_name FROM accounts WHERE truelayer_id = 'tl-seed'", ())
+        .await
+        .unwrap();
+    let name: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(name, "Seed current");
+
+    let mut rows = conn
+        .query("SELECT count(*) FROM transactions WHERE provider_txn_id = 'txn-seed'", ())
+        .await
+        .unwrap();
+    let n: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(n, 1);
+
+    for table in [
+        "financial_items",
+        "valuation_snapshots",
+        "investment_holdings",
+        "property_details",
+        "mortgage_details",
+        "tax_liability_details",
+        "receivable_details",
+        "forecast_scenarios",
+    ] {
+        let mut rows = conn
+            .query(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+                params![table],
+            )
+            .await
+            .unwrap();
+        let n: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(n, 1, "{table} should exist after 0014");
+    }
 }

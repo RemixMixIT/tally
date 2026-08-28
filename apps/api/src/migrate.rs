@@ -31,6 +31,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration { version: 11, name: "watchlist", sql: include_str!("../migrations/0011_watchlist.sql") },
     Migration { version: 12, name: "drop_watchlist", sql: include_str!("../migrations/0012_drop_watchlist.sql") },
     Migration { version: 13, name: "manual_accounts", sql: include_str!("../migrations/0013_manual_accounts.sql") },
+    Migration { version: 14, name: "financial_items", sql: include_str!("../migrations/0014_financial_items.sql") },
 ];
 
 const LEDGER_DDL: &str = "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
@@ -125,10 +126,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_db_applies_all_thirteen() {
+    async fn fresh_db_applies_all_fourteen() {
         let conn = mem().await;
         run(&conn).await.unwrap();
-        assert_eq!(applied_versions(&conn).await, (1..=13).collect::<Vec<_>>());
+        assert_eq!(applied_versions(&conn).await, (1..=14).collect::<Vec<_>>());
         // The real migration SQL produced real tables under libsql (dialect smoke check).
         assert!(app_table_count(&conn).await > 0);
     }
@@ -138,7 +139,7 @@ mod tests {
         let conn = mem().await;
         run(&conn).await.unwrap();
         run(&conn).await.unwrap(); // second run must be a no-op, not an error
-        assert_eq!(applied_versions(&conn).await, (1..=13).collect::<Vec<_>>());
+        assert_eq!(applied_versions(&conn).await, (1..=14).collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -149,7 +150,7 @@ mod tests {
         // and a re-running one would build tables. We assert no app table was created.
         let conn = mem().await;
         conn.execute_batch(LEDGER_DDL).await.unwrap();
-        for v in 1..=13i64 {
+        for v in 1..=14i64 {
             conn.execute(
                 "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
                  VALUES (?1, 'x', 1, ?2, 0)",
