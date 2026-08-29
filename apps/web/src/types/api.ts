@@ -239,6 +239,12 @@ export interface MortgageDetails {
   notes: string | null;
 }
 
+export interface LinkedMortgage {
+  item: FinancialItem;
+  mortgage: MortgageDetails;
+  counted_balance_gbp: number;
+}
+
 export interface ReceivableDetails {
   financial_item_id: number;
   debtor: string;

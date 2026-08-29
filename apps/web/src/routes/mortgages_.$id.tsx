@@ -76,7 +76,7 @@ function MortgagePage() {
             params={{ id: String(d.property.id) }}
             className="sm:col-span-2 text-green font-semibold"
           >
-            Open property
+            Open {d.property.name}
           </Link>
         )}
       </section>
@@ -87,6 +87,8 @@ function MortgagePage() {
         properties={(properties.data?.items ?? []).map((r) => r.item)}
         onSaved={() => {
           qc.invalidateQueries({ queryKey: ["mortgage", itemId] });
+          qc.invalidateQueries({ queryKey: ["property"] });
+          qc.invalidateQueries({ queryKey: ["financial-items"] });
           qc.invalidateQueries({ queryKey: ["net-worth"] });
         }}
       />
@@ -129,6 +131,9 @@ function MortgageForm({
   const [proj, setProj] = useState(existing?.projected_balance != null ? String(existing.projected_balance) : "");
   const [notes, setNotes] = useState(existing?.notes ?? "");
   const [error, setError] = useState<string | null>(null);
+  const selectable = properties.filter(
+    (p) => p.is_active === 1 || p.id === existing?.property_item_id
+  );
 
   const save = useMutation({
     mutationFn: () =>
@@ -163,10 +168,15 @@ function MortgageForm({
       <label className="text-xs text-mid md:col-span-2">
         Linked property
         <select className="input mt-1" value={propertyId} onChange={(e) => setPropertyId(e.target.value)}>
-          <option value="">None</option>
-          {properties.map((p) => (
-            <option key={p.id} value={p.id}>{p.name}</option>
+          <option value="">None — unlinked</option>
+          {selectable.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
           ))}
+          {propertyId && !selectable.some((p) => String(p.id) === propertyId) && (
+            <option value={propertyId}>Property #{propertyId} (unavailable)</option>
+          )}
         </select>
       </label>
       <select className="input" value={repay} onChange={(e) => setRepay(e.target.value)}>

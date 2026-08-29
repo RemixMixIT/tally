@@ -19,6 +19,7 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
     (12, "drop_watchlist", include_str!("../migrations/0012_drop_watchlist.sql")),
     (13, "manual_accounts", include_str!("../migrations/0013_manual_accounts.sql")),
     (14, "financial_items", include_str!("../migrations/0014_financial_items.sql")),
+    (15, "mortgage_property_index", include_str!("../migrations/0015_mortgage_property_index.sql")),
 ];
 
 async fn run(conn: &Connection) -> anyhow::Result<()> {
@@ -72,7 +73,7 @@ async fn all_migrations_apply_under_libsql() {
     let conn = db.connect().unwrap();
 
     run(&conn).await.unwrap();
-    assert_eq!(versions(&conn).await, (1..=14).collect::<Vec<_>>());
+    assert_eq!(versions(&conn).await, (1..=15).collect::<Vec<_>>());
 
     // The real migration SQL produced real tables under libsql's dialect.
     let mut rows = conn
@@ -88,7 +89,7 @@ async fn all_migrations_apply_under_libsql() {
 
     // Idempotent re-run.
     run(&conn).await.unwrap();
-    assert_eq!(versions(&conn).await, (1..=14).collect::<Vec<_>>());
+    assert_eq!(versions(&conn).await, (1..=15).collect::<Vec<_>>());
 }
 
 #[tokio::test]
@@ -148,7 +149,7 @@ async fn populated_db_keeps_existing_rows_after_0014() {
     .unwrap();
 
     run(&conn).await.unwrap();
-    assert_eq!(versions(&conn).await, (1..=14).collect::<Vec<_>>());
+    assert_eq!(versions(&conn).await, (1..=15).collect::<Vec<_>>());
 
     let mut rows = conn
         .query("SELECT display_name FROM accounts WHERE truelayer_id = 'tl-seed'", ())
@@ -184,4 +185,76 @@ async fn populated_db_keeps_existing_rows_after_0014() {
         let n: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(n, 1, "{table} should exist after 0014");
     }
+}
+
+#[tokio::test]
+async fn populated_0014_mortgages_survive_0015_index() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (version BIGINT PRIMARY KEY, \
+         description TEXT NOT NULL, installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+         success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL);",
+    )
+    .await
+    .unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=OFF;").await.ok();
+    for (v, name, sql) in &MIGRATIONS[..14] {
+        let tx = conn.transaction().await.unwrap();
+        tx.execute_batch(sql).await.unwrap();
+        tx.execute(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES (?1, ?2, 1, ?3, 0)",
+            params![*v, *name, Vec::<u8>::new()],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    conn.execute_batch("PRAGMA foreign_keys=ON;").await.ok();
+
+    conn.execute(
+        "INSERT INTO financial_items (
+            name, class, item_type, owner_entity, currency,
+            is_asset, is_liability, is_rollup, is_active, created_at, updated_at
+         ) VALUES ('IO mortgage', 'mortgage', 'interest_only', 'personal', 'GBP', 0, 1, 0, 1, 1, 1)",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO mortgage_details (
+            financial_item_id, property_item_id, repayment_type, outstanding_balance
+         ) VALUES (1, NULL, 'interest_only', 120000.0)",
+        (),
+    )
+    .await
+    .unwrap();
+
+    run(&conn).await.unwrap();
+    assert_eq!(versions(&conn).await, (1..=15).collect::<Vec<_>>());
+
+    let mut rows = conn
+        .query(
+            "SELECT property_item_id, outstanding_balance FROM mortgage_details WHERE financial_item_id = 1",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let pid: Option<i64> = row.get(0).unwrap();
+    let bal: f64 = row.get(1).unwrap();
+    assert_eq!(pid, None);
+    assert!((bal - 120_000.0).abs() < 1e-9);
+
+    let mut rows = conn
+        .query(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_mortgage_details_property'",
+            (),
+        )
+        .await
+        .unwrap();
+    let n: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(n, 1);
 }

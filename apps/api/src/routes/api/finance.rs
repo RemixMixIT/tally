@@ -200,19 +200,16 @@ pub async fn get_item(
             None
         }
     });
-    let linked_mortgage = if item.class == "property" {
-        let all = state.db.list_all_mortgages().await.map_err(internal)?;
-        let mut found = None;
-        for m in all {
-            if m.property_item_id == Some(id) {
-                found = Some(m);
-                break;
-            }
-        }
-        found
+    let linked_mortgages = if item.class == "property" {
+        state
+            .db
+            .list_mortgages_for_property(id)
+            .await
+            .map_err(internal)?
     } else {
-        None
+        Vec::new()
     };
+    let linked_mortgage = linked_mortgages.first().cloned();
     Ok(Json(json!({
         "item": item,
         "valuations": valuations,
@@ -222,6 +219,7 @@ pub async fn get_item(
         "property": property,
         "mortgage": mortgage,
         "linked_mortgage": linked_mortgage,
+        "linked_mortgages": linked_mortgages,
         "tax": tax,
         "receivable": receivable,
         "children": children,
@@ -479,12 +477,40 @@ pub async fn get_property(
         .map_err(internal)?
         .into_iter()
         .next();
-    let mortgages = state.db.list_all_mortgages().await.map_err(internal)?;
-    let linked: Vec<_> = mortgages
-        .into_iter()
-        .filter(|m| m.property_item_id == Some(id))
-        .collect();
-    let mortgage_gbp: f64 = linked.iter().map(|m| m.outstanding_balance).sum();
+    let mortgages = state
+        .db
+        .list_mortgages_for_property(id)
+        .await
+        .map_err(internal)?;
+    let mut linked = Vec::new();
+    let mut mortgage_gbp = 0.0;
+    for m in mortgages {
+        let Some(mtg_item) = state
+            .db
+            .get_financial_item(m.financial_item_id)
+            .await
+            .map_err(internal)?
+        else {
+            continue;
+        };
+        let latest_mtg = state
+            .db
+            .list_valuations(m.financial_item_id)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .next();
+        let counted = latest_mtg
+            .as_ref()
+            .map(|v| v.gbp_value)
+            .unwrap_or(m.outstanding_balance);
+        mortgage_gbp += counted;
+        linked.push(json!({
+            "item": mtg_item,
+            "mortgage": m,
+            "counted_balance_gbp": counted,
+        }));
+    }
     let property_gbp = latest.as_ref().map(|v| v.gbp_value).unwrap_or(0.0);
     Ok(Json(json!({
         "item": item,
@@ -551,21 +577,25 @@ pub async fn get_mortgage(
         .map_err(internal)?
         .into_iter()
         .next();
-    let property = match details.as_ref().and_then(|d| d.property_item_id) {
-        Some(pid) => state.db.get_financial_item(pid).await.map_err(internal)?,
-        None => None,
-    };
-    let property_val = if let Some(p) = &property {
-        state
-            .db
-            .list_valuations(p.id)
-            .await
-            .map_err(internal)?
-            .into_iter()
-            .next()
-    } else {
-        None
-    };
+    let mut property = None;
+    let mut property_val = None;
+    if let Some(pid) = details.as_ref().and_then(|d| d.property_item_id) {
+        match state.db.get_financial_item(pid).await.map_err(internal)? {
+            Some(p) if p.class == "property" => {
+                property_val = state
+                    .db
+                    .list_valuations(p.id)
+                    .await
+                    .map_err(internal)?
+                    .into_iter()
+                    .next();
+                property = Some(p);
+            }
+            Some(_) | None => {
+                // Linked id missing or no longer a property — treat as unlinked for display.
+            }
+        }
+    }
     let balance = latest
         .as_ref()
         .map(|v| v.gbp_value)
@@ -793,6 +823,7 @@ pub async fn net_worth_explanation(
             "If a parent has holdings it is a roll-up: holdings are counted, not the parent total.",
             "If no holdings exist, the parent account total is counted.",
             "Property is an asset; mortgage is a liability counted once (snapshot or outstanding balance, not both).",
+            "A mortgage may link to a property for traceability. The link does not subtract the mortgage twice: count the property once and the mortgage once.",
             "Receivables are assets; tax liabilities are liabilities.",
             "Enabled bank and manual account balances are included (cards, mortgages, and tax-type accounts as liabilities).",
             "Broker/Yahoo holdings are included at latest market value.",

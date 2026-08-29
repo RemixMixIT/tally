@@ -961,6 +961,31 @@ mod tests {
     }
 
     #[test]
+    fn property_mortgage_link_without_parent_still_counts_once_each() {
+        let world = FinanceWorld {
+            items: vec![
+                item(1, "House", "property", None, 0, 1),
+                item(2, "Mortgage", "mortgage", None, 0, 1),
+            ],
+            snapshots: vec![snap(1, 1, "2026-08-01", 280_000.0)],
+            mortgages: vec![MortgageView {
+                financial_item_id: 2,
+                property_item_id: Some(1),
+                outstanding_balance: 120_000.0,
+                repayment_type: "interest_only".into(),
+            }],
+            ..Default::default()
+        };
+        let r = compute_net_worth(&world, None);
+        assert_eq!(r.assets_gbp, 280_000.0);
+        assert_eq!(r.liabilities_gbp, 120_000.0);
+        assert_eq!(r.net_worth_gbp, 160_000.0);
+        assert_eq!(r.counted.len(), 2);
+        assert_eq!(r.counted.iter().filter(|c| c.role == "asset").count(), 1);
+        assert_eq!(r.counted.iter().filter(|c| c.role == "liability").count(), 1);
+    }
+
+    #[test]
     fn mortgage_snapshot_not_added_to_balance() {
         let world = FinanceWorld {
             items: vec![item(1, "IO mortgage", "mortgage", None, 0, 1)],

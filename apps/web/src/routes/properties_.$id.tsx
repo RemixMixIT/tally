@@ -13,7 +13,7 @@ import {
 } from "@/lib/finance";
 import type {
   FinancialItem,
-  MortgageDetails,
+  LinkedMortgage,
   PropertyDetails,
   ValuationSnapshot,
 } from "@/types/api";
@@ -26,7 +26,7 @@ type PropertyResponse = {
   item: FinancialItem;
   property: PropertyDetails | null;
   latest_valuation: ValuationSnapshot | null;
-  linked_mortgages: MortgageDetails[];
+  linked_mortgages: LinkedMortgage[];
   equity_gbp: number;
 };
 
@@ -80,12 +80,25 @@ function PropertyPage() {
           <p className="text-[10px] uppercase tracking-widest text-mid mb-1">Comparable sales</p>
           <p>{p?.comparable_sales_notes || "—"}</p>
         </div>
-        {d.linked_mortgages.map((m) => (
-          <div key={m.financial_item_id} className="sm:col-span-2 border-t border-thin pt-3">
-            <Link to="/mortgages/$id" params={{ id: String(m.financial_item_id) }} className="text-green font-semibold">
-              Linked mortgage
+        {d.linked_mortgages.length === 0 && (
+          <p className="sm:col-span-2 text-sm text-mid border-t border-thin pt-3">
+            No mortgage linked. Open a mortgage and choose this property in the selector.
+          </p>
+        )}
+        {d.linked_mortgages.map((row) => (
+          <div key={row.mortgage.financial_item_id} className="sm:col-span-2 border-t border-thin pt-3">
+            <p className="text-[10px] uppercase tracking-widest text-mid mb-1">Linked mortgage</p>
+            <Link
+              to="/mortgages/$id"
+              params={{ id: String(row.item.id) }}
+              className="text-green font-semibold"
+            >
+              {row.item.name}
             </Link>
-            <p className="mono text-sm mt-1">{formatGbp(m.outstanding_balance)} {m.repayment_type.replace(/_/g, " ")}</p>
+            <p className="mono text-sm mt-1">
+              {formatGbp(row.counted_balance_gbp)}{" "}
+              {row.mortgage.repayment_type.replace(/_/g, " ")}
+            </p>
           </div>
         ))}
       </section>

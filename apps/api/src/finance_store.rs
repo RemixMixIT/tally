@@ -832,6 +832,11 @@ impl Db {
         if let Some(p) = projected_balance {
             finance::validate_non_negative("projected_balance", p)?;
         }
+        let previous_property_id = self
+            .get_mortgage(item_id)
+            .await
+            .map_err(|e| FinanceError::Invalid(e.to_string()))?
+            .and_then(|m| m.property_item_id);
         if let Some(pid) = property_item_id {
             let prop = self
                 .get_financial_item(pid)
@@ -845,6 +850,17 @@ impl Db {
                 .execute(
                     "UPDATE financial_items SET parent_item_id = ?1, updated_at = ?2 WHERE id = ?3",
                     params![pid, now(), item_id],
+                )
+                .await
+                .map_err(|e| FinanceError::Invalid(e.to_string()))?;
+        } else if let Some(old_pid) = previous_property_id {
+            // Clearing the property link also clears the parent pointer when it still
+            // points at that property, so the mortgage can stand alone again.
+            self.conn
+                .execute(
+                    "UPDATE financial_items SET parent_item_id = NULL, updated_at = ?1
+                     WHERE id = ?2 AND parent_item_id = ?3",
+                    params![now(), item_id, old_pid],
                 )
                 .await
                 .map_err(|e| FinanceError::Invalid(e.to_string()))?;
@@ -1228,6 +1244,21 @@ impl Db {
 
     pub async fn list_all_mortgages(&self) -> Result<Vec<MortgageDetails>> {
         let rows = self.conn.query("SELECT * FROM mortgage_details", ()).await?;
+        crate::db::map_rows(rows).await
+    }
+
+    pub async fn list_mortgages_for_property(
+        &self,
+        property_item_id: i64,
+    ) -> Result<Vec<MortgageDetails>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM mortgage_details WHERE property_item_id = ?1
+                 ORDER BY financial_item_id",
+                params![property_item_id],
+            )
+            .await?;
         crate::db::map_rows(rows).await
     }
 
@@ -1629,6 +1660,226 @@ mod tests {
         assert!((r.net_worth_gbp - 78_500.0).abs() < 1e-6);
         assert!(r.excluded.iter().any(|e| e.name == "forecasts"));
         assert_eq!(db.list_forecasts().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mortgage_property_link_roundtrip_and_validation() {
+        let db = test_db().await;
+        let prop_a = db
+            .create_financial_item(
+                "64 Grangeside",
+                "property",
+                "residential",
+                "personal",
+                None,
+                None,
+                None,
+                "GBP",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let prop_b = db
+            .create_financial_item(
+                "Other house",
+                "property",
+                "residential",
+                "personal",
+                None,
+                None,
+                None,
+                "GBP",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let cash = db
+            .create_financial_item(
+                "Not a house",
+                "cash",
+                "savings",
+                "personal",
+                None,
+                None,
+                None,
+                "GBP",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let mtg = db
+            .create_financial_item(
+                "IO mortgage",
+                "mortgage",
+                "interest_only",
+                "personal",
+                None,
+                None,
+                None,
+                "GBP",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let unlinked = db
+            .upsert_mortgage(
+                mtg.id,
+                None,
+                "interest_only",
+                120_000.0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlinked.property_item_id, None);
+        assert!(db.list_mortgages_for_property(prop_a.id).await.unwrap().is_empty());
+
+        let linked = db
+            .upsert_mortgage(
+                mtg.id,
+                Some(prop_a.id),
+                "interest_only",
+                120_000.0,
+                Some(0.04),
+                Some("fixed"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(linked.property_item_id, Some(prop_a.id));
+        let fetched = db.get_mortgage(mtg.id).await.unwrap().unwrap();
+        assert_eq!(fetched.property_item_id, Some(prop_a.id));
+        let for_a = db.list_mortgages_for_property(prop_a.id).await.unwrap();
+        assert_eq!(for_a.len(), 1);
+        assert_eq!(for_a[0].financial_item_id, mtg.id);
+        let parent = db.get_financial_item(mtg.id).await.unwrap().unwrap();
+        assert_eq!(parent.parent_item_id, Some(prop_a.id));
+
+        db.create_valuation(
+            prop_a.id,
+            "2026-08-01",
+            180_000.0,
+            "GBP",
+            None,
+            None,
+            None,
+            "manual_estimate",
+            None,
+            "estimated",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let world = db.load_finance_world().await.unwrap();
+        let r = finance::compute_net_worth(&world, None);
+        assert_eq!(r.assets_gbp, 180_000.0);
+        assert_eq!(r.liabilities_gbp, 120_000.0);
+        assert_eq!(r.counted.len(), 2);
+
+        let moved = db
+            .upsert_mortgage(
+                mtg.id,
+                Some(prop_b.id),
+                "interest_only",
+                120_000.0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved.property_item_id, Some(prop_b.id));
+        assert!(db.list_mortgages_for_property(prop_a.id).await.unwrap().is_empty());
+        assert_eq!(db.list_mortgages_for_property(prop_b.id).await.unwrap().len(), 1);
+
+        let cleared = db
+            .upsert_mortgage(
+                mtg.id,
+                None,
+                "interest_only",
+                120_000.0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.property_item_id, None);
+        let after_clear = db.get_financial_item(mtg.id).await.unwrap().unwrap();
+        assert_eq!(after_clear.parent_item_id, None);
+
+        let err = db
+            .upsert_mortgage(
+                mtg.id,
+                Some(cash.id),
+                "interest_only",
+                120_000.0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("property item"));
+
+        let missing = db
+            .upsert_mortgage(
+                mtg.id,
+                Some(999_999),
+                "interest_only",
+                120_000.0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("not found"));
     }
 
     #[tokio::test]
