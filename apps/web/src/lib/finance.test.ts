@@ -6,6 +6,7 @@ import {
   isLiabilityClass,
   matchesItemFilters,
   parseOptionalNumber,
+  typeLabel,
 } from "./finance";
 import { formatGbp } from "./format";
 
@@ -23,6 +24,13 @@ describe("finance helpers", () => {
       expect(classLabel(c.value)).toBe(c.label);
     }
     expect(classLabel("credit_card")).toBe("Credit card");
+  });
+
+  it("labels item types, falling back to class", () => {
+    expect(typeLabel("tax_liability", "vat")).toBe("VAT");
+    expect(typeLabel("mortgage", "interest_only")).toBe("Interest only");
+    expect(typeLabel("tax_liability", "")).toBe("Tax liability");
+    expect(typeLabel("tax_liability", "custom_levy")).toBe("custom levy");
   });
 
   it("allows holdings only on investment and pension", () => {

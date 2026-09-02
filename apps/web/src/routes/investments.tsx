@@ -9,8 +9,9 @@ import {
   TrendingUp,
   TrendingDown,
 } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, type ApiError } from "@/lib/api";
 import { formatMoney } from "@/lib/format";
+import { invalidatePortfolio } from "@/lib/portfolio-queries";
 import { SymbolCombobox, type SymbolHit } from "@/components/SymbolCombobox";
 import { PortfolioChart } from "@/components/PortfolioChart";
 
@@ -68,10 +69,7 @@ function InvestmentsPage() {
   const syncQuotes = useMutation({
     mutationFn: () =>
       api.post<{ symbols: number; fetched: number }>("/api/holdings/sync-quotes"),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["holdings"] });
-      qc.invalidateQueries({ queryKey: ["holdings-net-worth"] });
-    },
+    onSuccess: () => invalidatePortfolio(qc),
   });
 
   const [showAddBroker, setShowAddBroker] = useState(false);
@@ -244,7 +242,10 @@ function BrokerCard({ broker }: { broker: Broker }) {
   const qc = useQueryClient();
   const del = useMutation({
     mutationFn: () => api.delete(`/api/brokers/${broker.id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["brokers"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["brokers"] });
+      invalidatePortfolio(qc);
+    },
   });
   return (
     <div className="card p-4 flex items-center justify-between">
@@ -346,10 +347,11 @@ function AddActivityForm({ brokers, onDone }: { brokers: Broker[]; onDone: () =>
   const [fee, setFee] = useState("");
   const [currency, setCurrency] = useState("GBP");
   const [notes, setNotes] = useState("");
+  const [error, setError] = useState<string | null>(null);
 
   const create = useMutation({
-    mutationFn: () =>
-      api.post<{ id: number; holding_id: number }>("/api/activities", {
+    mutationFn: async () => {
+      await api.post<{ id: number; holding_id: number }>("/api/activities", {
         broker_id: brokerId,
         symbol: symbol.toUpperCase().trim(),
         name: resolvedName,
@@ -360,12 +362,11 @@ function AddActivityForm({ brokers, onDone }: { brokers: Broker[]; onDone: () =>
         fee: fee ? parseFloat(fee) : 0,
         currency,
         notes: notes || null,
-      }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["holdings"] });
-      qc.invalidateQueries({ queryKey: ["holdings-net-worth"] });
-      onDone();
+      });
+      await invalidatePortfolio(qc);
     },
+    onSuccess: onDone,
+    onError: (e: ApiError) => setError(e.message),
   });
 
   function onSymbolPick(sym: string, hit?: SymbolHit) {
@@ -387,7 +388,9 @@ function AddActivityForm({ brokers, onDone }: { brokers: Broker[]; onDone: () =>
       className="card p-5 space-y-3 mb-4"
       onSubmit={(e) => {
         e.preventDefault();
-        if (canSubmit) create.mutate();
+        if (!canSubmit) return;
+        setError(null);
+        create.mutate();
       }}
     >
       <div className="grid sm:grid-cols-2 gap-3">
@@ -505,13 +508,14 @@ function AddActivityForm({ brokers, onDone }: { brokers: Broker[]; onDone: () =>
           />
         </div>
       </div>
+      {error && <p className="text-sm text-danger">{error}</p>}
       <div className="flex gap-2 pt-1">
         <button
           className="btn-cta"
           type="submit"
           disabled={create.isPending || !canSubmit}
         >
-          Record {type.toLowerCase()}
+          {create.isPending ? "Recording…" : `Record ${type.toLowerCase()}`}
         </button>
         <button type="button" className="btn-ghost" onClick={onDone}>
           Cancel
@@ -526,7 +530,7 @@ function HoldingRow({ h }: { h: EnrichedHolding }) {
   const navigate = useNavigate();
   const del = useMutation({
     mutationFn: () => api.delete(`/api/holdings/${h.holding.id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["holdings"] }),
+    onSuccess: () => invalidatePortfolio(qc),
   });
   const open = () =>
     navigate({ to: "/investments/$id", params: { id: h.holding.id.toString() } });

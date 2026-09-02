@@ -1,4 +1,4 @@
-import { createFileRoute, Link, useParams } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate, useParams } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { AlertTriangle, ArrowLeft, Plus } from "lucide-react";
@@ -49,14 +49,24 @@ function ItemDetailPage() {
   const { id } = useParams({ from: "/valuations_/$id" });
   const itemId = Number(id);
   const qc = useQueryClient();
+  const navigate = useNavigate();
+  const [removeError, setRemoveError] = useState<string | null>(null);
   const detail = useQuery({
     queryKey: ["financial-item", itemId],
     queryFn: () => api.get<DetailResponse>(`/api/financial-items/${itemId}`),
   });
 
-  const deactivate = useMutation({
+  const remove = useMutation({
     mutationFn: () => api.delete(`/api/financial-items/${itemId}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["financial-item", itemId] }),
+    onSuccess: async () => {
+      qc.removeQueries({ queryKey: ["financial-item", itemId] });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["financial-items"], refetchType: "all" }),
+        qc.invalidateQueries({ queryKey: ["net-worth"], refetchType: "all" }),
+      ]);
+      navigate({ to: "/valuations" });
+    },
+    onError: (e: ApiError) => setRemoveError(e.message),
   });
 
   if (detail.isPending) {
@@ -141,13 +151,17 @@ function ItemDetailPage() {
         </Link>
         <button
           className="btn-ghost text-danger"
+          disabled={remove.isPending}
           onClick={() => {
-            if (confirm("Deactivate or delete this item?")) deactivate.mutate();
+            if (!confirm(`Remove “${d.item.name}”?`)) return;
+            setRemoveError(null);
+            remove.mutate();
           }}
         >
-          Remove
+          {remove.isPending ? "Removing…" : "Remove"}
         </button>
       </div>
+      {removeError && <p className="text-sm text-danger">{removeError}</p>}
 
       <MetadataForm item={d.item} parent={d.parent} onSaved={invalidate} />
       <ValuationForm itemId={itemId} currency={d.item.currency} onSaved={invalidate} />

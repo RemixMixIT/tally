@@ -275,6 +275,9 @@ pub async fn create_activity(
         .recompute_holding_from_activities(holding_id)
         .await
         .map_err(internal)?;
+    if let Ok(Some(holding)) = state.db.get_holding(holding_id).await {
+        refresh_stale_quotes(&state, &[holding]).await;
+    }
     Ok(Json(json!({ "id": id, "holding_id": holding_id })))
 }
 

@@ -9,6 +9,7 @@ import {
   ITEM_TYPES,
   OWNER_ENTITIES,
   classLabel,
+  typeLabel,
   confidenceLabel,
   isoToday,
   matchesItemFilters,
@@ -190,7 +191,9 @@ function AssetsPage() {
                     )}
                   </td>
                   <td className="px-4 py-3 text-mid">
-                    {classLabel(i.class)}
+                    {i.is_liability === 1
+                      ? typeLabel(i.class, i.item_type)
+                      : classLabel(i.class)}
                     {i.is_liability === 1 ? (
                       <span className="block text-[10px] uppercase tracking-widest">
                         liability
@@ -218,22 +221,13 @@ function AssetsPage() {
                     )}
                   </td>
                   <td className="px-4 py-3 text-right">
-                    {i.class === "property" && (
+                    {i.class === "property" && i.is_liability !== 1 && (
                       <Link
                         to="/properties/$id"
                         params={{ id: String(i.id) }}
                         className="text-xs text-green mr-2"
                       >
                         Property
-                      </Link>
-                    )}
-                    {i.class === "mortgage" && (
-                      <Link
-                        to="/mortgages/$id"
-                        params={{ id: String(i.id) }}
-                        className="text-xs text-green mr-2"
-                      >
-                        Mortgage
                       </Link>
                     )}
                     <Link

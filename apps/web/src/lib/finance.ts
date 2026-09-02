@@ -138,6 +138,14 @@ export function classLabel(value: string): string {
   return ITEM_CLASSES.find((c) => c.value === value)?.label ?? value;
 }
 
+export function typeLabel(cls: string, itemType: string): string {
+  const types = ITEM_TYPES[cls as ItemClass];
+  const hit = types?.find((t) => t.value === itemType);
+  if (hit) return hit.label;
+  if (itemType.trim()) return itemType.replace(/_/g, " ");
+  return classLabel(cls);
+}
+
 export function confidenceLabel(value: string): string {
   return CONFIDENCE.find((c) => c.value === value)?.label ?? value;
 }

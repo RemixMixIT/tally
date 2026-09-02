@@ -16,6 +16,7 @@ import { useState } from "react";
 import { ArrowLeft, Check, Pencil, Plus, Trash2, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { formatDate, formatMoney } from "@/lib/format";
+import { invalidatePortfolio } from "@/lib/portfolio-queries";
 import { SymbolChart, type ActivityMarker } from "@/components/SymbolChart";
 
 /** unix-seconds → value for a <input type="datetime-local"> in local time. */
@@ -311,7 +312,7 @@ function ActivityRow({ a, holdingId }: { a: Activity; holdingId: number }) {
   const [editing, setEditing] = useState(false);
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["activities", holdingId] });
-    qc.invalidateQueries({ queryKey: ["holdings"] });
+    invalidatePortfolio(qc);
   };
   const del = useMutation({
     mutationFn: () => api.delete(`/api/activities/${a.id}`),
@@ -490,8 +491,8 @@ function AddActivityForm({
   const [notes, setNotes] = useState("");
 
   const create = useMutation({
-    mutationFn: () =>
-      api.post("/api/activities", {
+    mutationFn: async () => {
+      await api.post("/api/activities", {
         holding_id: holdingId,
         activity_type: type,
         timestamp: Math.floor(new Date(date).getTime() / 1000),
@@ -499,10 +500,11 @@ function AddActivityForm({
         price_per_unit: price ? parseFloat(price) : null,
         fee: fee ? parseFloat(fee) : 0,
         notes: notes || null,
-      }),
+      });
+      await qc.invalidateQueries({ queryKey: ["activities", holdingId] });
+      await invalidatePortfolio(qc);
+    },
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["activities", holdingId] });
-      qc.invalidateQueries({ queryKey: ["holdings"] });
       setQty("");
       setPrice("");
       setFee("");
