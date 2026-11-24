@@ -18,8 +18,8 @@ use tracing::{error, info};
 pub async fn start_scheduler(state: Arc<AppState>) -> Result<JobScheduler> {
     let sched = JobScheduler::new().await?;
 
-    let cron_expr = std::env::var("TALLY_SYNC_CRON")
-        .unwrap_or_else(|_| "0 7 0,6,12,18 * * *".to_string()); // 4× daily at :07
+    let cron_expr =
+        std::env::var("TALLY_SYNC_CRON").unwrap_or_else(|_| "0 7 0,6,12,18 * * *".to_string()); // 4× daily at :07
 
     let state_clone = state.clone();
     let job = Job::new_async(cron_expr.as_str(), move |_uuid, _l| {
@@ -84,6 +84,26 @@ pub async fn start_scheduler(state: Arc<AppState>) -> Result<JobScheduler> {
     })?;
     sched.add(cot_job).await?;
 
+    // Receipt intake stays off unless TALLY_IMMICH_RECEIPTS=1. Every 2 minutes is inside
+    // the five-minute REQ-001 window. The job is not registered while the adapter is off.
+    if crate::receipt::immich_receipts_enabled() {
+        let state_clone = state.clone();
+        let receipt_cron = std::env::var("TALLY_RECEIPT_POLL_CRON")
+            .unwrap_or_else(|_| "0 */2 * * * *".to_string());
+        let receipt_job = Job::new_async(receipt_cron.as_str(), move |_uuid, _l| {
+            let state = state_clone.clone();
+            Box::pin(async move {
+                if let Err(e) = crate::receipt::poll_immich(&state.db).await {
+                    error!("immich receipt poll failed: {e:#}");
+                }
+            })
+        })?;
+        sched.add(receipt_job).await?;
+        info!(cron = %receipt_cron, "immich receipt poller enabled");
+    } else {
+        info!("immich receipt poller off (TALLY_IMMICH_RECEIPTS is not 1)");
+    }
+
     sched.start().await?;
     info!(cron = %cron_expr, "scheduler started");
 
@@ -93,6 +113,11 @@ pub async fn start_scheduler(state: Arc<AppState>) -> Result<JobScheduler> {
         crate::valuation_feed::run_scheduled(&startup_state.db).await;
         crate::vanquis::run_scheduled(&startup_state.db).await;
         crate::capital_on_tap::run_scheduled(&startup_state.db).await;
+        if crate::receipt::immich_receipts_enabled() {
+            if let Err(e) = crate::receipt::poll_immich(&startup_state.db).await {
+                error!("startup immich receipt poll failed: {e:#}");
+            }
+        }
     });
     Ok(sched)
 }
@@ -116,7 +141,8 @@ pub async fn check_reminders(state: Arc<AppState>) {
         Ok(rs) => {
             for r in rs {
                 // Advance the deadline until it's in the future (handles long-dormant reminders).
-                let mut due = crate::recurrence::next_occurrence(&r.freq, r.every_n, r.anchor_day, r.due_at);
+                let mut due =
+                    crate::recurrence::next_occurrence(&r.freq, r.every_n, r.anchor_day, r.due_at);
                 while due <= now {
                     due = crate::recurrence::next_occurrence(&r.freq, r.every_n, r.anchor_day, due);
                 }

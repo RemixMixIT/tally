@@ -35,7 +35,8 @@ services:
       timeout: 5s
       start_period: 15s
       retries: 3
-    mem_limit: 200m
+    # Local receipt OCR (tesseract) needs more than the API's idle footprint.
+    mem_limit: 512m
     # Runtime hardening — drop all Linux capabilities and forbid privilege escalation.
     security_opt:
       - no-new-privileges:true

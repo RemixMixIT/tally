@@ -6,6 +6,8 @@ mod ai;
 mod auth;
 mod auth_backend;
 mod bill_match;
+mod capital_on_tap;
+mod claims;
 mod clients;
 mod crypto;
 mod db;
@@ -19,10 +21,11 @@ mod middleware;
 mod migrate;
 mod models;
 mod notifier;
-mod pairs;
 mod oidc;
+mod pairs;
 mod queeg_sso;
 mod ratelimit;
+mod receipt;
 mod recurrence;
 mod retirement;
 mod routes;
@@ -30,14 +33,13 @@ mod rules;
 mod scheduler;
 mod session_store;
 mod valuation_feed;
-mod capital_on_tap;
-mod claims;
 mod vanquis;
 
 use crate::clients::truelayer::TrueLayerClient;
 use crate::crypto::Crypto;
 use crate::db::Db;
 use crate::notifier::Notifier;
+use crate::session_store::LibsqlSessionStore;
 use anyhow::{Context, Result};
 use axum::http::{header, HeaderValue};
 use axum_login::AuthManagerLayerBuilder;
@@ -48,7 +50,6 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tower_sessions::cookie::SameSite;
 use tower_sessions::{Expiry, SessionManagerLayer};
-use crate::session_store::LibsqlSessionStore;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
@@ -67,7 +68,8 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tally=debug")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,tally=debug")),
         )
         .with_target(false)
         .compact()
@@ -85,9 +87,8 @@ async fn main() -> Result<()> {
         env::var("TALLY_TRUELAYER_CLIENT_ID").context("TALLY_TRUELAYER_CLIENT_ID must be set")?;
     let tl_client_secret = env::var("TALLY_TRUELAYER_CLIENT_SECRET")
         .context("TALLY_TRUELAYER_CLIENT_SECRET must be set")?;
-    let tl_redirect_base = env::var("TALLY_REDIRECT_URI_BASE").unwrap_or_else(|_| {
-        format!("http://localhost:{port}/auth")
-    });
+    let tl_redirect_base = env::var("TALLY_REDIRECT_URI_BASE")
+        .unwrap_or_else(|_| format!("http://localhost:{port}/auth"));
 
     let crypto = Crypto::from_env()?;
     let db = Db::connect(&database_url, crypto).await?;

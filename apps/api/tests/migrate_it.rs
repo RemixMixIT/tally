@@ -26,6 +26,7 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
     (19, "bill_account_funding", include_str!("../migrations/0019_bill_account_funding.sql")),
     (20, "package_b", include_str!("../migrations/0020_package_b.sql")),
     (21, "claim_flags", include_str!("../migrations/0021_claim_flags.sql")),
+    (22, "package_c", include_str!("../migrations/0022_package_c.sql")),
 ];
 
 async fn run(conn: &Connection) -> anyhow::Result<()> {
@@ -79,7 +80,7 @@ async fn all_migrations_apply_under_libsql() {
     let conn = db.connect().unwrap();
 
     run(&conn).await.unwrap();
-    assert_eq!(versions(&conn).await, (1..=21).collect::<Vec<_>>());
+    assert_eq!(versions(&conn).await, (1..=22).collect::<Vec<_>>());
 
     // The real migration SQL produced real tables under libsql's dialect.
     let mut rows = conn
@@ -95,7 +96,7 @@ async fn all_migrations_apply_under_libsql() {
 
     // Idempotent re-run.
     run(&conn).await.unwrap();
-    assert_eq!(versions(&conn).await, (1..=21).collect::<Vec<_>>());
+    assert_eq!(versions(&conn).await, (1..=22).collect::<Vec<_>>());
 }
 
 #[tokio::test]
@@ -155,7 +156,7 @@ async fn populated_db_keeps_existing_rows_after_0014() {
     .unwrap();
 
     run(&conn).await.unwrap();
-    assert_eq!(versions(&conn).await, (1..=21).collect::<Vec<_>>());
+    assert_eq!(versions(&conn).await, (1..=22).collect::<Vec<_>>());
 
     let mut rows = conn
         .query("SELECT display_name FROM accounts WHERE truelayer_id = 'tl-seed'", ())
@@ -239,7 +240,7 @@ async fn populated_0014_mortgages_survive_0015_index() {
     .unwrap();
 
     run(&conn).await.unwrap();
-    assert_eq!(versions(&conn).await, (1..=21).collect::<Vec<_>>());
+    assert_eq!(versions(&conn).await, (1..=22).collect::<Vec<_>>());
 
     let mut rows = conn
         .query(
