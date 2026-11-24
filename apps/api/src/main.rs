@@ -9,6 +9,7 @@ mod bill_match;
 mod clients;
 mod crypto;
 mod db;
+mod director;
 mod expenditure;
 mod finance;
 mod finance_store;

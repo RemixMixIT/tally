@@ -34,6 +34,8 @@ pub struct SyncResult {
     pub accounts_synced: i64,
     pub transactions_imported: i64,
     pub transactions_skipped: i64,
+    /// Tide re-pulls that updated an existing base row. Other importers leave this at 0.
+    pub transactions_refreshed: i64,
     pub recurring_imported: i64,
     pub errors: Vec<String>,
 }
@@ -146,6 +148,7 @@ impl Importer {
             accounts = result.accounts_synced,
             imported = result.transactions_imported,
             skipped = result.transactions_skipped,
+            refreshed = result.transactions_refreshed,
             recurring = result.recurring_imported,
             "sync complete"
         );
@@ -575,6 +578,100 @@ impl Importer {
         Ok(())
     }
 
+    /// Returns true when this transaction must not be inserted.
+    /// Tide accounts that were seen already have their base row refreshed.
+    /// A Tide seen-set hit with no transaction row returns false so the insert path runs once.
+    async fn handle_seen_transaction(
+        &self,
+        account: &crate::models::Account,
+        txn: &TLTransaction,
+        is_pending: bool,
+        result: &mut SyncResult,
+    ) -> bool {
+        let tide = crate::director::is_tide_statement_account(
+            &account.display_name,
+            account.custom_display_name.as_deref(),
+        );
+        match self.db.is_txn_seen(account.id, &txn.transaction_id).await {
+            Ok(false) => false,
+            Ok(true) if !tide => {
+                result.transactions_skipped += 1;
+                true
+            }
+            Err(e) => {
+                warn!("is_txn_seen lookup failed: {e:#}");
+                true
+            }
+            Ok(true) => match self.refresh_tide_base_row(account, txn, is_pending).await {
+                Ok(true) => {
+                    result.transactions_refreshed += 1;
+                    let _ = self
+                        .db
+                        .record_txn_imported(
+                            account.id,
+                            &txn.transaction_id,
+                            None,
+                            is_pending,
+                            None,
+                        )
+                        .await;
+                    true
+                }
+                Ok(false) => false,
+                Err(e) => {
+                    warn!("tide refresh failed: {e:#}");
+                    result
+                        .errors
+                        .push(format!("txn {}: {e:#}", txn.transaction_id));
+                    true
+                }
+            },
+        }
+    }
+
+    async fn refresh_tide_base_row(
+        &self,
+        account: &crate::models::Account,
+        txn: &TLTransaction,
+        is_pending: bool,
+    ) -> Result<bool> {
+        let is_credit = !txn.transaction_type.eq_ignore_ascii_case("DEBIT");
+        let amount_cents = (txn.amount.abs() * 100.0).round() as i64;
+        let ts = DateTime::parse_from_rfc3339(&txn.timestamp)
+            .map(|d| d.timestamp())
+            .unwrap_or_else(|_| Utc::now().timestamp());
+        let cp_iban = txn.meta.as_ref().and_then(|m| m.counter_party_iban.clone());
+        let cp_name = txn
+            .meta
+            .as_ref()
+            .and_then(|m| m.counter_party_preferred_name.clone())
+            .or_else(|| txn.merchant_name.clone());
+        let raw_json = serde_json::to_string(&serde_json::json!({
+            "description": txn.description,
+            "category": txn.transaction_category,
+            "classification": txn.transaction_classification,
+            "merchant": txn.merchant_name,
+            "currency": txn.currency,
+        }))
+        .ok();
+        self.db
+            .refresh_transaction_base(
+                account.id,
+                &txn.transaction_id,
+                ts,
+                &txn.description,
+                amount_cents,
+                &txn.currency,
+                is_credit,
+                is_pending,
+                txn.merchant_name.as_deref(),
+                cp_iban.as_deref(),
+                cp_name.as_deref(),
+                raw_json.as_deref(),
+            )
+            .await
+    }
+
     async fn persist_transactions(
         &self,
         account: &crate::models::Account,
@@ -586,17 +683,13 @@ impl Importer {
         result: &mut SyncResult,
     ) {
         for txn in txns {
-            // De-dup gate: have we seen this provider txn id before?
-            match self.db.is_txn_seen(account.id, &txn.transaction_id).await {
-                Ok(true) => {
-                    result.transactions_skipped += 1;
-                    continue;
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    warn!("is_txn_seen lookup failed: {e:#}");
-                    continue;
-                }
+            // Other TrueLayer accounts keep the seen-set skip. Tide re-pulls refresh
+            // the base row instead, and never insert a second copy.
+            if self
+                .handle_seen_transaction(account, &txn, is_pending, result)
+                .await
+            {
+                continue;
             }
 
             let is_credit = !txn.transaction_type.eq_ignore_ascii_case("DEBIT");
@@ -1003,4 +1096,184 @@ fn leading_token(name: &str) -> Option<String> {
         .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '.'))
         .find(|t| t.len() >= 4)
         .map(|t| t.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clients::truelayer::TrueLayerClient;
+    use crate::crypto::Crypto;
+    use crate::db::Db;
+    use crate::learn::LearnEngine;
+    use crate::models::truelayer::TLTransaction;
+    use crate::notifier::Notifier;
+    use crate::rules::CompiledRules;
+    use base64::engine::general_purpose::STANDARD as B64STD;
+    use base64::Engine;
+
+    async fn test_db() -> Db {
+        let crypto = Crypto::from_b64(&B64STD.encode([9u8; 32])).unwrap();
+        let database = libsql::Builder::new_local(":memory:").build().await.unwrap();
+        let conn = database.connect().unwrap();
+        crate::migrate::run(&conn).await.unwrap();
+        Db {
+            conn: std::sync::Arc::new(conn),
+            crypto,
+        }
+    }
+
+    fn importer(db: Db) -> Importer {
+        let mut notifier = Notifier::from_env();
+        notifier.ha_url = None;
+        notifier.ha_token = None;
+        notifier.telegram_token = None;
+        notifier.telegram_chat = None;
+        notifier.db = None;
+        Importer {
+            tl: TrueLayerClient::new("test".into(), "test".into(), "http://127.0.0.1".into())
+                .unwrap(),
+            ai: crate::ai::AiClient::new(db.clone()),
+            db,
+            notifier,
+        }
+    }
+
+    fn txn(id: &str, description: &str, amount: f64) -> TLTransaction {
+        serde_json::from_value(serde_json::json!({
+            "transaction_id": id,
+            "timestamp": "2025-06-15T12:00:00Z",
+            "description": description,
+            "amount": amount,
+            "currency": "GBP",
+            "transaction_type": "DEBIT",
+            "transaction_category": "OFFICE",
+            "merchant_name": "LANDLORD"
+        }))
+        .unwrap()
+    }
+
+    async fn pull(imp: &Importer, account: &crate::models::Account, txns: Vec<TLTransaction>) -> SyncResult {
+        let mut result = SyncResult::default();
+        let rules = CompiledRules { rules: vec![] };
+        let mut learned = LearnEngine::from_parts(vec![], &[]);
+        imp.persist_transactions(account, txns, false, &rules, &mut learned, &[], &mut result)
+            .await;
+        result
+    }
+
+    async fn one_row(db: &Db, account_id: i64) -> crate::models::Transaction {
+        let rows = db
+            .list_transactions(Some(&[account_id]), None, None, None, None, None, None, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        rows.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn tide_repull_refreshes_base_row_and_keeps_classification() {
+        let db = test_db().await;
+        let tide = db
+            .create_manual_account("Tide Current Account", "business_current", None)
+            .await
+            .unwrap();
+        let imp = importer(db.clone());
+
+        let first = pull(&imp, &tide, vec![txn("tl-tide-1", "OFFICE RENT", 10.0)]).await;
+        assert_eq!(first.transactions_imported, 1);
+        assert_eq!(first.transactions_refreshed, 0);
+
+        let row = one_row(&db, tide.id).await;
+        let cat = db
+            .create_category("Office", None, None, None)
+            .await
+            .unwrap();
+        db.update_transaction_category(row.id, Some(cat)).await.unwrap();
+        db.update_transaction_notes(row.id, Some("keep me"))
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE transactions
+                 SET receipt_photo_id = 'immich-1',
+                     claim_flags = '[\"remixmix\"]',
+                     claim_pack_id = 'pack-a',
+                     claim_pack_id_2 = 'pack-b'
+                 WHERE id = ?1",
+                libsql::params![row.id],
+            )
+            .await
+            .unwrap();
+        db.set_director_classification(
+            tide.id,
+            "tl-tide-1",
+            "expense",
+            row.amount_cents,
+            Some("https://example.test/evidence"),
+            Some("director note"),
+        )
+        .await
+        .unwrap();
+
+        let second = pull(
+            &imp,
+            &tide,
+            vec![txn("tl-tide-1", "OFFICE RENT UPDATED", 12.5)],
+        )
+        .await;
+        assert_eq!(second.transactions_imported, 0);
+        assert_eq!(second.transactions_refreshed, 1);
+        assert_eq!(second.transactions_skipped, 0);
+        assert!(second.errors.is_empty());
+
+        let again = one_row(&db, tide.id).await;
+        assert_eq!(again.id, row.id);
+        assert_eq!(again.description, "OFFICE RENT UPDATED");
+        assert_eq!(again.amount_cents, 1250);
+        assert_eq!(again.category_id, Some(cat));
+        assert_eq!(again.notes.as_deref(), Some("keep me"));
+
+        let mut flags = db
+            .conn
+            .query(
+                "SELECT receipt_photo_id, claim_flags, claim_pack_id, claim_pack_id_2
+                 FROM transactions WHERE id = ?1",
+                libsql::params![row.id],
+            )
+            .await
+            .unwrap();
+        let flag_row = flags.next().await.unwrap().unwrap();
+        assert_eq!(flag_row.get::<String>(0).unwrap(), "immich-1");
+        assert_eq!(flag_row.get::<String>(1).unwrap(), "[\"remixmix\"]");
+        assert_eq!(flag_row.get::<String>(2).unwrap(), "pack-a");
+        assert_eq!(flag_row.get::<String>(3).unwrap(), "pack-b");
+
+        let (start, end) = crate::director::accounts_period();
+        let listed = db.list_director_payments(start, end).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].classification_type.as_deref(), Some("expense"));
+        assert_eq!(listed[0].classification_notes.as_deref(), Some("director note"));
+        assert_eq!(listed[0].classification_amount_cents, Some(row.amount_cents));
+        assert_eq!(listed[0].description, "OFFICE RENT UPDATED");
+        assert_eq!(listed[0].amount_cents, 1250);
+    }
+
+    #[tokio::test]
+    async fn non_tide_repull_still_skips() {
+        let db = test_db().await;
+        let barclays = db
+            .create_manual_account("Barclays Bank Account", "current", None)
+            .await
+            .unwrap();
+        let imp = importer(db.clone());
+        let first = pull(&imp, &barclays, vec![txn("tl-barc-1", "COFFEE", 3.5)]).await;
+        assert_eq!(first.transactions_imported, 1);
+        let second = pull(&imp, &barclays, vec![txn("tl-barc-1", "COFFEE CHANGED", 9.0)]).await;
+        assert_eq!(second.transactions_imported, 0);
+        assert_eq!(second.transactions_refreshed, 0);
+        assert_eq!(second.transactions_skipped, 1);
+        let row = one_row(&db, barclays.id).await;
+        assert_eq!(row.description, "COFFEE");
+        assert_eq!(row.amount_cents, 350);
+    }
 }

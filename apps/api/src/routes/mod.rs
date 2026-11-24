@@ -193,6 +193,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/forecasts/{id}",
             put(api::finance::update_forecast).delete(api::finance::delete_forecast),
         )
+        .route(
+            "/director-payments",
+            get(api::director::list).put(api::director::set),
+        )
         .route("/expenditure", get(api::expenditure::summary))
         .route("/net-worth", get(api::finance::net_worth))
         .route("/net-worth/history", get(api::finance::net_worth_history))

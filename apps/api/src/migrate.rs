@@ -18,26 +18,110 @@ struct Migration {
 
 /// All migrations, embedded in the binary so the container needs no migrations directory.
 const MIGRATIONS: &[Migration] = &[
-    Migration { version: 1, name: "init", sql: include_str!("../migrations/0001_init.sql") },
-    Migration { version: 2, name: "full_features", sql: include_str!("../migrations/0002_full_features.sql") },
-    Migration { version: 3, name: "auth", sql: include_str!("../migrations/0003_auth.sql") },
-    Migration { version: 4, name: "ai_settings", sql: include_str!("../migrations/0004_ai_settings.sql") },
-    Migration { version: 5, name: "holdings", sql: include_str!("../migrations/0005_holdings.sql") },
-    Migration { version: 6, name: "balances_renames", sql: include_str!("../migrations/0006_balances_renames.sql") },
-    Migration { version: 7, name: "oauth", sql: include_str!("../migrations/0007_oauth.sql") },
-    Migration { version: 8, name: "drop_legacy_auth", sql: include_str!("../migrations/0008_drop_legacy_auth.sql") },
-    Migration { version: 9, name: "drop_api_tokens", sql: include_str!("../migrations/0009_drop_api_tokens.sql") },
-    Migration { version: 10, name: "reminders", sql: include_str!("../migrations/0010_reminders.sql") },
-    Migration { version: 11, name: "watchlist", sql: include_str!("../migrations/0011_watchlist.sql") },
-    Migration { version: 12, name: "drop_watchlist", sql: include_str!("../migrations/0012_drop_watchlist.sql") },
-    Migration { version: 13, name: "manual_accounts", sql: include_str!("../migrations/0013_manual_accounts.sql") },
-    Migration { version: 14, name: "financial_items", sql: include_str!("../migrations/0014_financial_items.sql") },
-    Migration { version: 15, name: "mortgage_property_index", sql: include_str!("../migrations/0015_mortgage_property_index.sql") },
-    Migration { version: 16, name: "transfer_pairs", sql: include_str!("../migrations/0016_transfer_pairs.sql") },
-    Migration { version: 17, name: "transfer_unmatchable", sql: include_str!("../migrations/0017_transfer_unmatchable.sql") },
-    Migration { version: 18, name: "transfer_await", sql: include_str!("../migrations/0018_transfer_await.sql") },
-    Migration { version: 19, name: "bill_account_funding", sql: include_str!("../migrations/0019_bill_account_funding.sql") },
+    Migration {
+        version: 1,
+        name: "init",
+        sql: include_str!("../migrations/0001_init.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "full_features",
+        sql: include_str!("../migrations/0002_full_features.sql"),
+    },
+    Migration {
+        version: 3,
+        name: "auth",
+        sql: include_str!("../migrations/0003_auth.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "ai_settings",
+        sql: include_str!("../migrations/0004_ai_settings.sql"),
+    },
+    Migration {
+        version: 5,
+        name: "holdings",
+        sql: include_str!("../migrations/0005_holdings.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "balances_renames",
+        sql: include_str!("../migrations/0006_balances_renames.sql"),
+    },
+    Migration {
+        version: 7,
+        name: "oauth",
+        sql: include_str!("../migrations/0007_oauth.sql"),
+    },
+    Migration {
+        version: 8,
+        name: "drop_legacy_auth",
+        sql: include_str!("../migrations/0008_drop_legacy_auth.sql"),
+    },
+    Migration {
+        version: 9,
+        name: "drop_api_tokens",
+        sql: include_str!("../migrations/0009_drop_api_tokens.sql"),
+    },
+    Migration {
+        version: 10,
+        name: "reminders",
+        sql: include_str!("../migrations/0010_reminders.sql"),
+    },
+    Migration {
+        version: 11,
+        name: "watchlist",
+        sql: include_str!("../migrations/0011_watchlist.sql"),
+    },
+    Migration {
+        version: 12,
+        name: "drop_watchlist",
+        sql: include_str!("../migrations/0012_drop_watchlist.sql"),
+    },
+    Migration {
+        version: 13,
+        name: "manual_accounts",
+        sql: include_str!("../migrations/0013_manual_accounts.sql"),
+    },
+    Migration {
+        version: 14,
+        name: "financial_items",
+        sql: include_str!("../migrations/0014_financial_items.sql"),
+    },
+    Migration {
+        version: 15,
+        name: "mortgage_property_index",
+        sql: include_str!("../migrations/0015_mortgage_property_index.sql"),
+    },
+    Migration {
+        version: 16,
+        name: "transfer_pairs",
+        sql: include_str!("../migrations/0016_transfer_pairs.sql"),
+    },
+    Migration {
+        version: 17,
+        name: "transfer_unmatchable",
+        sql: include_str!("../migrations/0017_transfer_unmatchable.sql"),
+    },
+    Migration {
+        version: 18,
+        name: "transfer_await",
+        sql: include_str!("../migrations/0018_transfer_await.sql"),
+    },
+    Migration {
+        version: 19,
+        name: "bill_account_funding",
+        sql: include_str!("../migrations/0019_bill_account_funding.sql"),
+    },
+    Migration {
+        version: 20,
+        name: "package_b",
+        sql: include_str!("../migrations/0020_package_b.sql"),
+    },
 ];
+
+#[cfg(test)]
+const PACKAGE_B_DOWN_SQL: &str = include_str!("../migrations/down/0020_package_b.sql");
 
 const LEDGER_DDL: &str = "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
     version BIGINT PRIMARY KEY,
@@ -108,7 +192,10 @@ mod tests {
 
     async fn applied_versions(conn: &Connection) -> Vec<i64> {
         let mut rows = conn
-            .query("SELECT version FROM _sqlx_migrations WHERE success=1 ORDER BY version", ())
+            .query(
+                "SELECT version FROM _sqlx_migrations WHERE success=1 ORDER BY version",
+                (),
+            )
             .await
             .unwrap();
         let mut v = Vec::new();
@@ -116,6 +203,31 @@ mod tests {
             v.push(r.get::<i64>(0).unwrap());
         }
         v
+    }
+
+    async fn table_exists(conn: &Connection, name: &str) -> bool {
+        let mut rows = conn
+            .query(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+                libsql::params![name],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap() == 1
+    }
+
+    async fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+        let mut rows = conn
+            .query(&format!("PRAGMA table_info({table})"), ())
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            let name: String = row.get(1).unwrap();
+            if name == column {
+                return true;
+            }
+        }
+        false
     }
 
     async fn app_table_count(conn: &Connection) -> i64 {
@@ -134,9 +246,19 @@ mod tests {
     async fn fresh_db_applies_all_migrations() {
         let conn = mem().await;
         run(&conn).await.unwrap();
-        assert_eq!(applied_versions(&conn).await, (1..=19).collect::<Vec<_>>());
+        assert_eq!(applied_versions(&conn).await, (1..=20).collect::<Vec<_>>());
         // The real migration SQL produced real tables under libsql (dialect smoke check).
         assert!(app_table_count(&conn).await > 0);
+        assert!(table_exists(&conn, "pending_receipt").await);
+        assert!(table_exists(&conn, "director_classification").await);
+        for col in [
+            "receipt_photo_id",
+            "claim_flags",
+            "claim_pack_id",
+            "claim_pack_id_2",
+        ] {
+            assert!(column_exists(&conn, "transactions", col).await, "{col}");
+        }
     }
 
     #[tokio::test]
@@ -144,7 +266,32 @@ mod tests {
         let conn = mem().await;
         run(&conn).await.unwrap();
         run(&conn).await.unwrap(); // second run must be a no-op, not an error
+        assert_eq!(applied_versions(&conn).await, (1..=20).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn package_b_down_script_removes_only_package_b_objects() {
+        let conn = mem().await;
+        run(&conn).await.unwrap();
+        let before = app_table_count(&conn).await;
+        conn.execute_batch(PACKAGE_B_DOWN_SQL).await.unwrap();
+        assert!(!table_exists(&conn, "pending_receipt").await);
+        assert!(!table_exists(&conn, "director_classification").await);
+        for col in [
+            "receipt_photo_id",
+            "claim_flags",
+            "claim_pack_id",
+            "claim_pack_id_2",
+        ] {
+            assert!(!column_exists(&conn, "transactions", col).await, "{col}");
+        }
+        assert!(table_exists(&conn, "transactions").await);
+        assert!(table_exists(&conn, "accounts").await);
+        assert_eq!(app_table_count(&conn).await, before - 2);
         assert_eq!(applied_versions(&conn).await, (1..=19).collect::<Vec<_>>());
+        run(&conn).await.unwrap();
+        assert!(table_exists(&conn, "director_classification").await);
+        assert_eq!(applied_versions(&conn).await, (1..=20).collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -155,7 +302,7 @@ mod tests {
         // and a re-running one would build tables. We assert no app table was created.
         let conn = mem().await;
         conn.execute_batch(LEDGER_DDL).await.unwrap();
-        for v in 1..=19i64 {
+        for v in 1..=20i64 {
             conn.execute(
                 "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
                  VALUES (?1, 'x', 1, ?2, 0)",
@@ -165,6 +312,10 @@ mod tests {
             .unwrap();
         }
         run(&conn).await.unwrap();
-        assert_eq!(app_table_count(&conn).await, 0, "no migration should have run");
+        assert_eq!(
+            app_table_count(&conn).await,
+            0,
+            "no migration should have run"
+        );
     }
 }

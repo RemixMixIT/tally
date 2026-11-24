@@ -388,6 +388,47 @@ impl FromLibsqlRow for Transaction {
     }
 }
 
+/// One Tide payment in the director classification view.
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectorPayment {
+    pub transaction_id: i64,
+    pub account_id: i64,
+    pub account_name: String,
+    pub tide_transaction_id: String,
+    pub timestamp: i64,
+    pub description: String,
+    pub amount_cents: i64,
+    pub currency: String,
+    pub tide_category: Option<String>,
+    pub tally_category: Option<String>,
+    pub classification_type: Option<String>,
+    pub classification_amount_cents: Option<i64>,
+    pub evidence_link: Option<String>,
+    pub classification_notes: Option<String>,
+}
+
+impl FromLibsqlRow for DirectorPayment {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            transaction_id: col!(c, row, "transaction_id"),
+            account_id: col!(c, row, "account_id"),
+            account_name: col!(c, row, "account_name"),
+            tide_transaction_id: col!(c, row, "tide_transaction_id"),
+            timestamp: col!(c, row, "timestamp"),
+            description: col!(c, row, "description"),
+            amount_cents: col!(c, row, "amount_cents"),
+            currency: col!(c, row, "currency"),
+            tide_category: col!(c, row, "tide_category"),
+            tally_category: col!(c, row, "tally_category"),
+            classification_type: col!(c, row, "classification_type"),
+            classification_amount_cents: col!(c, row, "classification_amount_cents"),
+            evidence_link: col!(c, row, "evidence_link"),
+            classification_notes: col!(c, row, "classification_notes"),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Category {
     pub id: i64,

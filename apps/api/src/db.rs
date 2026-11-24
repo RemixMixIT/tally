@@ -1118,6 +1118,8 @@ impl Db {
                     counterparty_name = COALESCE(excluded.counterparty_name, transactions.counterparty_name),
                     raw_json = COALESCE(excluded.raw_json, transactions.raw_json),
                     updated_at = excluded.updated_at
+                 -- category_id, notes, receipt_photo_id, claim flags and claim pack ids
+                 -- are insert-only. A re-pull must not wipe them.
                  RETURNING id",
                 params![
                     account_id,
@@ -1143,6 +1145,183 @@ impl Db {
             .next()
             .await?
             .context("upsert_transaction RETURNING id produced no row")?;
+        Ok(row.get::<i64>(0)?)
+    }
+
+    /// Refresh the provider-owned columns of one existing transaction.
+    /// Does not insert. Does not touch category, notes, receipt, claim, or classification data.
+    /// Returns whether a row was updated.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn refresh_transaction_base(
+        &self,
+        account_id: i64,
+        provider_txn_id: &str,
+        timestamp: i64,
+        description: &str,
+        amount_cents: i64,
+        currency: &str,
+        is_credit: bool,
+        is_pending: bool,
+        merchant_name: Option<&str>,
+        counterparty_iban: Option<&str>,
+        counterparty_name: Option<&str>,
+        raw_json: Option<&str>,
+    ) -> Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE transactions SET
+                    timestamp = ?1,
+                    description = ?2,
+                    amount_cents = ?3,
+                    currency = ?4,
+                    is_credit = ?5,
+                    is_pending = ?6,
+                    merchant_name = COALESCE(?7, merchant_name),
+                    counterparty_iban = COALESCE(?8, counterparty_iban),
+                    counterparty_name = COALESCE(?9, counterparty_name),
+                    raw_json = COALESCE(?10, raw_json),
+                    updated_at = ?11
+                 WHERE account_id = ?12 AND provider_txn_id = ?13",
+                params![
+                    timestamp,
+                    description,
+                    amount_cents,
+                    currency,
+                    if is_credit { 1_i64 } else { 0 },
+                    if is_pending { 1_i64 } else { 0 },
+                    merchant_name,
+                    counterparty_iban,
+                    counterparty_name,
+                    raw_json,
+                    Utc::now().timestamp(),
+                    account_id,
+                    provider_txn_id,
+                ],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    pub async fn set_director_classification(
+        &self,
+        account_id: i64,
+        tide_transaction_id: &str,
+        classification_type: &str,
+        amount_cents: i64,
+        evidence_link: Option<&str>,
+        notes: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO director_classification (
+                    account_id, tide_transaction_id, classification_type, amount,
+                    evidence_link, notes, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(account_id, tide_transaction_id) DO UPDATE SET
+                    classification_type = excluded.classification_type,
+                    amount = excluded.amount,
+                    evidence_link = excluded.evidence_link,
+                    notes = excluded.notes,
+                    updated_at = excluded.updated_at",
+                params![
+                    account_id,
+                    tide_transaction_id,
+                    classification_type,
+                    amount_cents,
+                    evidence_link,
+                    notes,
+                    now,
+                    now,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_director_classification(
+        &self,
+        account_id: i64,
+        tide_transaction_id: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM director_classification
+                 WHERE account_id = ?1 AND tide_transaction_id = ?2",
+                params![account_id, tide_transaction_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_director_payments(
+        &self,
+        start: i64,
+        end_exclusive: i64,
+    ) -> Result<Vec<DirectorPayment>> {
+        let sql = format!(
+            "SELECT
+                t.id AS transaction_id,
+                t.account_id AS account_id,
+                CASE
+                    WHEN a.custom_display_name IS NOT NULL AND a.custom_display_name != ''
+                    THEN a.custom_display_name
+                    ELSE a.display_name
+                END AS account_name,
+                t.provider_txn_id AS tide_transaction_id,
+                t.timestamp AS timestamp,
+                t.description AS description,
+                t.amount_cents AS amount_cents,
+                t.currency AS currency,
+                CAST(json_extract(t.raw_json, '$.category') AS TEXT) AS tide_category,
+                c.name AS tally_category,
+                d.classification_type AS classification_type,
+                d.amount AS classification_amount_cents,
+                d.evidence_link AS evidence_link,
+                d.notes AS classification_notes
+             FROM transactions t
+             JOIN accounts a ON a.id = t.account_id
+             LEFT JOIN categories c ON c.id = t.category_id
+             LEFT JOIN director_classification d
+               ON d.account_id = t.account_id
+              AND d.tide_transaction_id = t.provider_txn_id
+             WHERE t.is_credit = 0
+               AND t.timestamp >= ?1
+               AND t.timestamp < ?2
+               AND {tide}
+             ORDER BY t.timestamp, t.id",
+            tide = crate::director::TIDE_ACCOUNT_SQL,
+        );
+        let rows = self
+            .conn
+            .query(&sql, params![start, end_exclusive])
+            .await?;
+        map_rows(rows).await
+    }
+
+    pub async fn count_tide_payments_outside_period(
+        &self,
+        start: i64,
+        end_exclusive: i64,
+    ) -> Result<i64> {
+        let sql = format!(
+            "SELECT count(*)
+             FROM transactions t
+             JOIN accounts a ON a.id = t.account_id
+             WHERE t.is_credit = 0
+               AND (t.timestamp < ?1 OR t.timestamp >= ?2)
+               AND {tide}",
+            tide = crate::director::TIDE_ACCOUNT_SQL,
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, params![start, end_exclusive])
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .context("count_tide_payments_outside_period returned no row")?;
         Ok(row.get::<i64>(0)?)
     }
 
@@ -3308,6 +3487,54 @@ mod roundtrip_tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn director_payments_are_tide_debits_inside_the_accounts_period() {
+        let db = test_db().await;
+        let tide = db
+            .create_manual_account("Tide Current Account", "business_current", None)
+            .await
+            .unwrap();
+        let smile = db
+            .create_manual_account("Smile", "current", None)
+            .await
+            .unwrap();
+        let (start, end) = crate::director::accounts_period();
+        let inside = start + 86_400;
+        let outside = end + 86_400;
+        db.upsert_transaction(
+            tide.id, "in-debit", inside, "IN PERIOD", 100, "GBP", false, false, None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+        db.upsert_transaction(
+            tide.id, "in-credit", inside, "MONEY IN", 100, "GBP", true, false, None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+        db.upsert_transaction(
+            tide.id, "out-debit", outside, "AFTER PERIOD", 100, "GBP", false, false, None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+        db.upsert_transaction(
+            smile.id, "smile-debit", inside, "SMILE", 100, "GBP", false, false, None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+        db.set_director_classification(tide.id, "in-debit", "salary", 100, None, None)
+            .await
+            .unwrap();
+
+        let listed = db.list_director_payments(start, end).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].tide_transaction_id, "in-debit");
+        assert_eq!(listed[0].classification_type.as_deref(), Some("salary"));
+        assert_eq!(
+            db.count_tide_payments_outside_period(start, end).await.unwrap(),
+            1
         );
     }
 }
