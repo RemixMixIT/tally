@@ -97,6 +97,121 @@ function ClaimsPage() {
       {save.isError && (
         <p className="text-xs text-orange mt-3">Could not save those flags.</p>
       )}
+      <ClaimPacks />
     </div>
+  );
+}
+
+interface PackLine {
+  source_kind: string;
+  source_id: number;
+  amount: string;
+  date: string;
+  supplier: string;
+  category: string;
+  receipt_link: string;
+}
+
+interface ClaimPackRow {
+  id: string;
+  party: string;
+  total: string;
+  lines: PackLine[];
+}
+
+function ClaimPacks() {
+  const qc = useQueryClient();
+  const packs = useQuery({
+    queryKey: ["claim-packs"],
+    queryFn: () =>
+      api.get<{ packs: ClaimPackRow[]; source_total: string }>("/api/claim-packs"),
+  });
+  const generate = useMutation({
+    mutationFn: () =>
+      api.post<{ packs: ClaimPackRow[]; source_total: string }>("/api/claim-packs"),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["claim-packs"] }),
+  });
+  const rows = packs.data?.packs ?? [];
+
+  return (
+    <section className="mt-10">
+      <div className="flex flex-wrap items-end justify-between gap-3 mb-4">
+        <div>
+          <h2 className="text-lg font-extrabold">Claim packs</h2>
+          <p className="text-sm text-mid mt-1 max-w-xl">
+            Prepares amount, date, supplier, category and the receipt link.
+            RemixMix is one pack. Client-X is another. A dual claim is on both,
+            with two pack ids, and the source total still counts it once.
+          </p>
+        </div>
+        <button
+          type="button"
+          className="btn-cta"
+          disabled={generate.isPending}
+          onClick={() => generate.mutate()}
+        >
+          {generate.isPending ? "Preparing" : "Prepare packs"}
+        </button>
+      </div>
+      {packs.data && (
+        <p className="text-sm mb-4">
+          Source total {packs.data.source_total}. This is each flagged item once,
+          not the two pack totals added together.
+        </p>
+      )}
+      {generate.isError && (
+        <p className="text-sm text-orange mb-3">Could not prepare the packs.</p>
+      )}
+      {!packs.isLoading && rows.length === 0 && (
+        <div className="card p-5 text-sm text-mid">
+          No packs yet. Mark RemixMix, Client-X, or both, then prepare packs.
+        </div>
+      )}
+      <ul className="space-y-4">
+        {rows.map((pack) => (
+          <li key={pack.id} className="card p-4">
+            <div className="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+              <div>
+                <span className={pack.party === "RemixMix" ? "pill-green" : "pill-orange"}>
+                  {pack.party}
+                </span>
+                <p className="text-xs text-mid mono mt-2">{pack.id}</p>
+              </div>
+              <p className="font-semibold mono">{pack.total}</p>
+            </div>
+            <p className="text-xs mb-3">
+              <a className="underline" href={`/api/claim-packs/${encodeURIComponent(pack.id)}?format=csv`}>
+                CSV
+              </a>
+              <a className="underline ml-3" href={`/api/claim-packs/${encodeURIComponent(pack.id)}?format=md`}>
+                Markdown
+              </a>
+            </p>
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-xs text-mid">
+                  <th className="py-1 pr-2">Amount</th>
+                  <th className="py-1 pr-2">Date</th>
+                  <th className="py-1 pr-2">Supplier</th>
+                  <th className="py-1 pr-2">Category</th>
+                  <th className="py-1">Receipt</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pack.lines.map((line) => (
+                  <tr key={`${line.source_kind}-${line.source_id}`}>
+                    <td className="py-1 pr-2 mono">{line.amount}</td>
+                    <td className="py-1 pr-2">{line.date}</td>
+                    <td className="py-1 pr-2">{line.supplier}</td>
+                    <td className="py-1 pr-2">{line.category}</td>
+                    <td className="py-1 mono text-xs">{line.receipt_link}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }

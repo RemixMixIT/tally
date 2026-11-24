@@ -7,6 +7,7 @@ mod auth;
 mod auth_backend;
 mod bill_match;
 mod capital_on_tap;
+mod claim_packs;
 mod claims;
 mod clients;
 mod crypto;

@@ -8,7 +8,7 @@
 
 use crate::claims::{self, is_dual};
 use crate::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
@@ -81,4 +81,98 @@ pub async fn patch(
 
 fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))
+}
+
+fn pack_json(pack: &crate::claim_packs::ClaimPack) -> Value {
+    json!({
+        "id": pack.id,
+        "party": pack.party,
+        "created_at": pack.created_at,
+        "total_cents": pack.total_cents,
+        "total": pack.total,
+        "lines": pack.lines,
+    })
+}
+
+pub async fn list_packs(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let packs = crate::claim_packs::list_saved_packs(&state.db)
+        .await
+        .map_err(internal)?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut source_total_cents = 0;
+    for pack in &packs {
+        for line in &pack.lines {
+            if seen.insert((line.source_kind.clone(), line.source_id)) {
+                source_total_cents += line.amount_cents;
+            }
+        }
+    }
+    Ok(Json(json!({
+        "packs": packs.iter().map(pack_json).collect::<Vec<_>>(),
+        "source_total_cents": source_total_cents,
+        "source_total": crate::claim_packs::format_gbp(source_total_cents),
+    })))
+}
+
+pub async fn generate(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let created_at = chrono::Utc::now().timestamp();
+    let set = crate::claim_packs::generate(&state.db, created_at)
+        .await
+        .map_err(internal)?;
+    Ok(Json(json!({
+        "packs": set.packs.iter().map(pack_json).collect::<Vec<_>>(),
+        "source_total_cents": set.source_total_cents(),
+        "source_total": crate::claim_packs::format_gbp(set.source_total_cents()),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ShowQuery {
+    pub format: Option<String>,
+}
+
+pub async fn show_pack(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<ShowQuery>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    use axum::response::IntoResponse;
+    let packs = crate::claim_packs::list_saved_packs(&state.db)
+        .await
+        .map_err(internal)?;
+    let pack = packs
+        .into_iter()
+        .find(|pack| pack.id == id)
+        .ok_or((StatusCode::NOT_FOUND, "claim pack not found".into()))?;
+    let format = query.format.as_deref().unwrap_or("json");
+    let response = match format {
+        "csv" => (
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "text/csv; charset=utf-8".to_string(),
+                ),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{id}.csv\""),
+                ),
+            ],
+            crate::claim_packs::render_csv(&pack),
+        )
+            .into_response(),
+        "md" => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/markdown; charset=utf-8".to_string(),
+            )],
+            crate::claim_packs::render_markdown(&pack),
+        )
+            .into_response(),
+        _ => Json(pack_json(&pack)).into_response(),
+    };
+    Ok(response)
 }

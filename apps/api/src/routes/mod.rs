@@ -205,6 +205,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/pending-receipts/{id}",
             patch(api::claims::patch),
         )
+        .route(
+            "/claim-packs",
+            get(api::claims::list_packs).post(api::claims::generate),
+        )
+        .route("/claim-packs/{id}", get(api::claims::show_pack))
         .route("/expenditure", get(api::expenditure::summary))
         .route("/net-worth", get(api::finance::net_worth))
         .route("/net-worth/history", get(api::finance::net_worth_history))
