@@ -31,6 +31,7 @@ mod scheduler;
 mod session_store;
 mod valuation_feed;
 mod capital_on_tap;
+mod claims;
 mod vanquis;
 
 use crate::clients::truelayer::TrueLayerClient;

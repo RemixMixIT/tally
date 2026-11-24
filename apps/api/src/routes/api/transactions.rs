@@ -4,6 +4,7 @@
 //! POST /api/transactions/apply-learned — run learned mapping over uncategorised
 //! PATCH /api/transactions/:id — update category, notes, tags (category PATCH is the remember event)
 
+use crate::claims::{self, is_dual};
 use crate::learn::{self, ReviewReason};
 use crate::models::Transaction;
 use crate::pairs;
@@ -234,6 +235,8 @@ pub async fn transfers(
 pub struct PatchBody {
     pub category_id: Option<Option<i64>>, // explicit None to clear, omitted to leave alone
     pub notes: Option<Option<String>>,
+    /// Present replaces the flags. An empty array clears them. Omitted leaves them.
+    pub claim_flags: Option<Vec<String>>,
 }
 
 pub async fn patch(
@@ -254,6 +257,18 @@ pub async fn patch(
             .update_transaction_notes(id, notes.as_deref())
             .await
             .map_err(internal)?;
+    }
+    if let Some(flags) = body.claim_flags {
+        let stored = claims::normalize_claim_flags(&flags)
+            .map_err(|m| (StatusCode::BAD_REQUEST, m))?;
+        let updated = state
+            .db
+            .update_transaction_claim_flags(id, stored.as_deref())
+            .await
+            .map_err(internal)?;
+        if !updated {
+            return Err((StatusCode::NOT_FOUND, "transaction not found".into()));
+        }
     }
     let txn = state
         .db
@@ -457,6 +472,7 @@ fn enrich_txn(t: &Transaction) -> Value {
             "payee".to_string(),
             json!(learn::payee_label(t.merchant_name.as_deref(), &t.description)),
         );
+        obj.insert("dual".to_string(), json!(is_dual(&t.claim_flags)));
     }
     v
 }

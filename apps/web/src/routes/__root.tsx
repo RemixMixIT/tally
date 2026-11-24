@@ -25,6 +25,7 @@ import {
   AlarmClock,
   Scale,
   Tags,
+  Flag,
   PieChart,
   Sparkles,
   BarChart3,
@@ -101,6 +102,9 @@ function RootLayout() {
             icon={<ReceiptText className="size-[18px]" />}
           >
             Transactions
+          </NavItem>
+          <NavItem to="/claims" icon={<Flag className="size-[18px]" />}>
+            Claims
           </NavItem>
           <NavItem to="/director" icon={<Tags className="size-[18px]" />}>
             Director payments

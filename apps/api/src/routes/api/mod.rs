@@ -17,4 +17,5 @@ pub mod tags;
 pub mod telegram;
 pub mod transactions;
 pub mod capital_on_tap;
+pub mod claims;
 pub mod vanquis;

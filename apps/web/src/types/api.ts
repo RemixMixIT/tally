@@ -63,6 +63,9 @@ export interface Transaction {
   counterparty_name: string | null;
   category_id: number | null;
   notes: string | null;
+  /** RemixMix and/or Client-X. Both means a dual claim. */
+  claim_flags?: string[];
+  dual?: boolean;
   /** Extracted payee (issued-by company, fee/period stripped). */
   payee?: string;
   transfer_pair_id: number | null;

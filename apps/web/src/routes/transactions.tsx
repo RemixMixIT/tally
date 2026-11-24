@@ -100,6 +100,15 @@ function TransactionsPage() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["transactions"] }),
   });
 
+  const saveFlags = useMutation({
+    mutationFn: ({ id, claim_flags }: { id: number; claim_flags: string[] }) =>
+      api.patch(`/api/transactions/${id}`, { claim_flags }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["transactions"] });
+      qc.invalidateQueries({ queryKey: ["transaction"] });
+    },
+  });
+
   const suggestOne = useMutation({
     mutationFn: (id: number) =>
       api.post<{ suggested_category_id: number | null }>(
@@ -414,6 +423,9 @@ function TransactionsPage() {
           }
           onSetNotes={(notes) =>
             saveNotes.mutate({ id: selectedTxn.id, notes })
+          }
+          onSetClaimFlags={(claim_flags) =>
+            saveFlags.mutate({ id: selectedTxn.id, claim_flags })
           }
         />
       )}

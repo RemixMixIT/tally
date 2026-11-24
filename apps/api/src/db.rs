@@ -1528,6 +1528,78 @@ impl Db {
         Ok(())
     }
 
+    /// Replace claim flags. `None` clears them. Does not touch pack ids.
+    pub async fn update_transaction_claim_flags(
+        &self,
+        id: i64,
+        flags_json: Option<&str>,
+    ) -> Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE transactions SET claim_flags = ?1, updated_at = ?2 WHERE id = ?3",
+                params![flags_json, Utc::now().timestamp(), id],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    pub async fn insert_pending_receipt(
+        &self,
+        photo_id: &str,
+        extracted_amount: Option<i64>,
+        extracted_date: Option<i64>,
+        status: &str,
+    ) -> Result<i64> {
+        let now = Utc::now().timestamp();
+        let mut rows = self
+            .conn
+            .query(
+                "INSERT INTO pending_receipt (
+                    photo_id, extracted_amount, extracted_date, status, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 RETURNING id",
+                params![photo_id, extracted_amount, extracted_date, status, now, now],
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .context("insert_pending_receipt returned no id")?;
+        Ok(row.get::<i64>(0)?)
+    }
+
+    pub async fn list_pending_receipts(&self) -> Result<Vec<PendingReceipt>> {
+        let rows = self
+            .conn
+            .query("SELECT * FROM pending_receipt ORDER BY id", ())
+            .await?;
+        map_rows(rows).await
+    }
+
+    pub async fn get_pending_receipt(&self, id: i64) -> Result<Option<PendingReceipt>> {
+        let rows = self
+            .conn
+            .query("SELECT * FROM pending_receipt WHERE id = ?1", params![id])
+            .await?;
+        map_opt(rows).await
+    }
+
+    pub async fn update_pending_receipt_claim_flags(
+        &self,
+        id: i64,
+        flags_json: Option<&str>,
+    ) -> Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE pending_receipt SET claim_flags = ?1, updated_at = ?2 WHERE id = ?3",
+                params![flags_json, Utc::now().timestamp(), id],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
     /// Filtered/paged transactions query.
     /// All filters optional; ordering newest-first by default.
     #[allow(clippy::too_many_arguments)]

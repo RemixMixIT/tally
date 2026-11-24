@@ -118,10 +118,17 @@ const MIGRATIONS: &[Migration] = &[
         name: "package_b",
         sql: include_str!("../migrations/0020_package_b.sql"),
     },
+    Migration {
+        version: 21,
+        name: "claim_flags",
+        sql: include_str!("../migrations/0021_claim_flags.sql"),
+    },
 ];
 
 #[cfg(test)]
 const PACKAGE_B_DOWN_SQL: &str = include_str!("../migrations/down/0020_package_b.sql");
+#[cfg(test)]
+const CLAIM_FLAGS_DOWN_SQL: &str = include_str!("../migrations/down/0021_claim_flags.sql");
 
 const LEDGER_DDL: &str = "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
     version BIGINT PRIMARY KEY,
@@ -246,7 +253,7 @@ mod tests {
     async fn fresh_db_applies_all_migrations() {
         let conn = mem().await;
         run(&conn).await.unwrap();
-        assert_eq!(applied_versions(&conn).await, (1..=20).collect::<Vec<_>>());
+        assert_eq!(applied_versions(&conn).await, (1..=21).collect::<Vec<_>>());
         // The real migration SQL produced real tables under libsql (dialect smoke check).
         assert!(app_table_count(&conn).await > 0);
         assert!(table_exists(&conn, "pending_receipt").await);
@@ -259,6 +266,7 @@ mod tests {
         ] {
             assert!(column_exists(&conn, "transactions", col).await, "{col}");
         }
+        assert!(column_exists(&conn, "pending_receipt", "claim_flags").await);
     }
 
     #[tokio::test]
@@ -266,7 +274,7 @@ mod tests {
         let conn = mem().await;
         run(&conn).await.unwrap();
         run(&conn).await.unwrap(); // second run must be a no-op, not an error
-        assert_eq!(applied_versions(&conn).await, (1..=20).collect::<Vec<_>>());
+        assert_eq!(applied_versions(&conn).await, (1..=21).collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -274,6 +282,8 @@ mod tests {
         let conn = mem().await;
         run(&conn).await.unwrap();
         let before = app_table_count(&conn).await;
+        // 0021 sits on pending_receipt, so its down runs before the Package B down.
+        conn.execute_batch(CLAIM_FLAGS_DOWN_SQL).await.unwrap();
         conn.execute_batch(PACKAGE_B_DOWN_SQL).await.unwrap();
         assert!(!table_exists(&conn, "pending_receipt").await);
         assert!(!table_exists(&conn, "director_classification").await);
@@ -291,7 +301,23 @@ mod tests {
         assert_eq!(applied_versions(&conn).await, (1..=19).collect::<Vec<_>>());
         run(&conn).await.unwrap();
         assert!(table_exists(&conn, "director_classification").await);
+        assert!(column_exists(&conn, "pending_receipt", "claim_flags").await);
+        assert_eq!(applied_versions(&conn).await, (1..=21).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn claim_flags_down_removes_only_the_pending_column() {
+        let conn = mem().await;
+        run(&conn).await.unwrap();
+        conn.execute_batch(CLAIM_FLAGS_DOWN_SQL).await.unwrap();
+        assert!(!column_exists(&conn, "pending_receipt", "claim_flags").await);
+        assert!(column_exists(&conn, "transactions", "claim_flags").await);
+        assert!(table_exists(&conn, "pending_receipt").await);
+        assert!(table_exists(&conn, "director_classification").await);
         assert_eq!(applied_versions(&conn).await, (1..=20).collect::<Vec<_>>());
+        run(&conn).await.unwrap();
+        assert!(column_exists(&conn, "pending_receipt", "claim_flags").await);
+        assert_eq!(applied_versions(&conn).await, (1..=21).collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -302,7 +328,7 @@ mod tests {
         // and a re-running one would build tables. We assert no app table was created.
         let conn = mem().await;
         conn.execute_batch(LEDGER_DDL).await.unwrap();
-        for v in 1..=20i64 {
+        for v in 1..=21i64 {
             conn.execute(
                 "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
                  VALUES (?1, 'x', 1, ?2, 0)",

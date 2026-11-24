@@ -513,6 +513,7 @@ pub async fn import_parsed(
             transfer_pair_id: None,
             transfer_unmatchable: 0,
             transfer_await_account_id: None,
+            claim_flags: Vec::new(),
             created_at: 0,
             updated_at: 0,
         };

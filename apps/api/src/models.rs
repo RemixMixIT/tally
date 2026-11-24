@@ -353,6 +353,9 @@ pub struct Transaction {
     #[serde(default)]
     pub transfer_unmatchable: i64,
     pub transfer_await_account_id: Option<i64>,
+    /// JSON array of "RemixMix" and/or "Client-X". Empty when the column is null.
+    #[serde(default)]
+    pub claim_flags: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -382,6 +385,45 @@ impl FromLibsqlRow for Transaction {
                 None => 0,
             },
             transfer_await_account_id: col_opt!(c, row, "transfer_await_account_id"),
+            claim_flags: {
+                let raw: Option<String> = col_opt!(c, row, "claim_flags");
+                crate::claims::parse_stored(raw.as_deref())
+            },
+            created_at: col!(c, row, "created_at"),
+            updated_at: col!(c, row, "updated_at"),
+        })
+    }
+}
+
+/// A receipt that is not yet a matched bank line. Claim flags live on the row.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingReceipt {
+    pub id: i64,
+    pub photo_id: String,
+    pub extracted_amount: Option<i64>,
+    pub extracted_date: Option<i64>,
+    pub status: String,
+    pub linked_transaction_id: Option<i64>,
+    #[serde(default)]
+    pub claim_flags: Vec<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl FromLibsqlRow for PendingReceipt {
+    fn from_row(row: &libsql::Row) -> anyhow::Result<Self> {
+        let c = ColumnIndex::new(row);
+        Ok(Self {
+            id: col!(c, row, "id"),
+            photo_id: col!(c, row, "photo_id"),
+            extracted_amount: col_opt!(c, row, "extracted_amount"),
+            extracted_date: col_opt!(c, row, "extracted_date"),
+            status: col!(c, row, "status"),
+            linked_transaction_id: col_opt!(c, row, "linked_transaction_id"),
+            claim_flags: {
+                let raw: Option<String> = col_opt!(c, row, "claim_flags");
+                crate::claims::parse_stored(raw.as_deref())
+            },
             created_at: col!(c, row, "created_at"),
             updated_at: col!(c, row, "updated_at"),
         })

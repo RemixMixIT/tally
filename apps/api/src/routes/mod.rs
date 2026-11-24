@@ -197,6 +197,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/director-payments",
             get(api::director::list).put(api::director::set),
         )
+        .route(
+            "/pending-receipts",
+            get(api::claims::list),
+        )
+        .route(
+            "/pending-receipts/{id}",
+            patch(api::claims::patch),
+        )
         .route("/expenditure", get(api::expenditure::summary))
         .route("/net-worth", get(api::finance::net_worth))
         .route("/net-worth/history", get(api::finance::net_worth_history))

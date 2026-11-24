@@ -5,11 +5,13 @@ import {
   Building2,
   Calendar,
   Hash,
+  Flag,
   Receipt,
   StickyNote,
   Tag,
   X,
 } from "lucide-react";
+import { ClaimFlagToggles } from "@/components/ClaimFlagToggles";
 import { TransferAwareCategorySelect } from "@/components/TransferAwareCategorySelect";
 import { TransferPairMenu } from "@/components/TransferPairMenu";
 import { api } from "@/lib/api";
@@ -33,6 +35,7 @@ export function TransactionDrawer({
   onClose,
   onSetCategory,
   onSetNotes,
+  onSetClaimFlags,
 }: {
   txn: Transaction;
   account: Account | null;
@@ -43,6 +46,7 @@ export function TransactionDrawer({
   onClose: () => void;
   onSetCategory: (id: number | null) => void;
   onSetNotes: (notes: string | null) => void;
+  onSetClaimFlags: (flags: string[]) => void;
 }) {
   const qc = useQueryClient();
   const [notesDraft, setNotesDraft] = useState(txn.notes ?? "");
@@ -313,6 +317,12 @@ export function TransactionDrawer({
                     "Pairing failed"}
                 </p>
               )}
+            </DrawerRow>
+            <DrawerRow icon={<Flag className="size-4" />} label="Claim">
+              <ClaimFlagToggles
+                flags={live.claim_flags ?? []}
+                onChange={onSetClaimFlags}
+              />
             </DrawerRow>
             <DrawerRow icon={<StickyNote className="size-4" />} label="Notes">
               <textarea

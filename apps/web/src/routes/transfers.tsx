@@ -78,6 +78,14 @@ function TransfersPage() {
       api.patch(`/api/transactions/${id}`, { notes }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["transfers"] }),
   });
+  const saveFlags = useMutation({
+    mutationFn: ({ id, claim_flags }: { id: number; claim_flags: string[] }) =>
+      api.patch(`/api/transactions/${id}`, { claim_flags }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["transfers"] });
+      qc.invalidateQueries({ queryKey: ["transaction"] });
+    },
+  });
 
   const rows = transfers.data?.transactions ?? [];
   const selectedTxn = rows.find((t) => t.id === selectedId) ?? null;
@@ -204,6 +212,9 @@ function TransfersPage() {
           }
           onSetNotes={(notes) =>
             saveNotes.mutate({ id: selectedTxn.id, notes })
+          }
+          onSetClaimFlags={(claim_flags) =>
+            saveFlags.mutate({ id: selectedTxn.id, claim_flags })
           }
         />
       )}
