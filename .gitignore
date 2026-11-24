@@ -29,9 +29,13 @@ SECRETS.local.md
 # Logs & scratch
 *.log
 *.bak
+*.bak-*
 *.orig
 *.tmp
 coverage/
+
+# Local Cargo home (registry cache, not source)
+apps/api/.cargo-home/
 
 # Internal notes (not for public release)
 docs/
