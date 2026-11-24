@@ -16,6 +16,19 @@ const AUTH_BASE: &str = "https://auth.truelayer.com";
 const DATA_BASE: &str = "https://api.truelayer.com/data/v1";
 const USER_AGENT: &str = concat!("tally/", env!("CARGO_PKG_VERSION"));
 
+/// Loopback / empty addresses are useless to the bank and can make a request
+/// look malformed; skip the header in that case.
+pub fn usable_psu_ip(ip: String) -> Option<String> {
+    let ip = ip.trim();
+    if ip.is_empty() || ip.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+    if ip == "127.0.0.1" || ip == "::1" || ip == "localhost" {
+        return None;
+    }
+    Some(ip.to_string())
+}
+
 /// The full OAuth scope set we request. Matches what's documented in TRUELAYER-API.md.
 pub const SCOPE: &str = "info accounts balance cards transactions direct_debits standing_orders offline_access";
 
@@ -28,6 +41,9 @@ pub struct TrueLayerClient {
     pub client_secret: String,
     pub redirect_uri_base: String, // e.g. https://tally.example.com/auth
     http: Client,
+    /// End-user IP for attended Open Banking calls (`X-PSU-IP`). Unattended
+    /// (scheduler) syncs leave this unset and count toward the ~4/day AIS cap.
+    psu_ip: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,18 +52,42 @@ struct AccessTokenClaims {
     exp: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct TxnPage {
+    #[serde(default)]
+    results: Vec<serde_json::Value>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    results_uri: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+    #[serde(default)]
+    links: Option<crate::models::truelayer::ApiLinks>,
+}
+
 impl TrueLayerClient {
     pub fn new(client_id: String, client_secret: String, redirect_uri_base: String) -> Result<Self> {
         let http = Client::builder()
             .user_agent(USER_AGENT)
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(45))
             .build()?;
         Ok(Self {
             client_id,
             client_secret,
             redirect_uri_base,
             http,
+            psu_ip: None,
         })
+    }
+
+    /// Clone this client tagged with the PSU IP from a user-initiated request.
+    pub fn with_psu_ip(&self, ip: Option<String>) -> Self {
+        let mut c = self.clone();
+        c.psu_ip = ip.and_then(usable_psu_ip);
+        c
     }
 
     /// Single OAuth redirect URI — the consent nickname is carried in the `state` token,
@@ -158,26 +198,132 @@ impl TrueLayerClient {
         Ok(new_tokens.access_token)
     }
 
+    async fn send_get(&self, access_token: &str, path_or_url: &str) -> Result<reqwest::Response> {
+        let url = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+            path_or_url.to_string()
+        } else {
+            format!("{DATA_BASE}/{}", path_or_url.trim_start_matches('/'))
+        };
+        let mut req = self
+            .http
+            .get(&url)
+            .bearer_auth(access_token)
+            .header("Accept", "application/json");
+        if let Some(ip) = &self.psu_ip {
+            req = req.header("X-PSU-IP", ip);
+        }
+        req.send().await.with_context(|| format!("GET {url}"))
+    }
+
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         access_token: &str,
         path: &str,
     ) -> Result<T> {
-        let url = format!("{DATA_BASE}/{}", path.trim_start_matches('/'));
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(access_token)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        let resp = self.send_get(access_token, path).await?;
+        let url = resp.url().clone();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
             return Err(anyhow!("{url} failed: status {status}, body: {body}"));
         }
-        Ok(resp.json::<T>().await.with_context(|| format!("parsing JSON from {url}"))?)
+        serde_json::from_str(&body).with_context(|| format!("parsing JSON from {url}: {body}"))
+    }
+
+    fn parse_transaction_values(values: Vec<serde_json::Value>) -> Vec<TLTransaction> {
+        let mut out = Vec::with_capacity(values.len());
+        for v in values {
+            match serde_json::from_value::<TLTransaction>(v.clone()) {
+                Ok(t) => out.push(t),
+                Err(e) => tracing::warn!("skipping unparseable TrueLayer transaction: {e}; {v}"),
+            }
+        }
+        out
+    }
+
+    async fn fetch_transaction_pages(
+        &self,
+        access_token: &str,
+        start_path: &str,
+    ) -> Result<Vec<TLTransaction>> {
+        let mut url = start_path.to_string();
+        let mut all = Vec::new();
+        for _page in 0..20 {
+            let page = self.get_transaction_page(access_token, &url).await?;
+            all.extend(Self::parse_transaction_values(page.results));
+            match page.links.and_then(|l| l.next).filter(|n| !n.is_empty()) {
+                Some(next) if next != url => url = next,
+                _ => break,
+            }
+        }
+        Ok(all)
+    }
+
+    async fn get_transaction_page(
+        &self,
+        access_token: &str,
+        path_or_url: &str,
+    ) -> Result<TxnPage> {
+        let resp = self.send_get(access_token, path_or_url).await?;
+        let url = resp.url().clone();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 429 {
+            return Err(anyhow!("{url} failed: status {status}, body: {body}"));
+        }
+        if status.as_u16() == 202 {
+            let page: TxnPage = serde_json::from_str(&body)
+                .with_context(|| format!("parsing async 202 from {url}: {body}"))?;
+            return self.poll_transaction_page(access_token, page).await;
+        }
+        if !status.is_success() {
+            return Err(anyhow!("{url} failed: status {status}, body: {body}"));
+        }
+        let page: TxnPage = serde_json::from_str(&body)
+            .with_context(|| format!("parsing transactions from {url}: {body}"))?;
+        let pending = page
+            .status
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("queued") || s.eq_ignore_ascii_case("running"));
+        if pending {
+            return self.poll_transaction_page(access_token, page).await;
+        }
+        Ok(page)
+    }
+
+    async fn poll_transaction_page(&self, access_token: &str, page: TxnPage) -> Result<TxnPage> {
+        let results_uri = page
+            .results_uri
+            .clone()
+            .ok_or_else(|| anyhow!("async transaction response missing results_uri"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+        let mut delay = std::time::Duration::from_millis(400);
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(delay).await;
+            let resp = self.send_get(access_token, &results_uri).await?;
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if !status.is_success() && status.as_u16() != 202 {
+                return Err(anyhow!(
+                    "{results_uri} failed: status {status}, body: {body}"
+                ));
+            }
+            let polled: TxnPage = serde_json::from_str(&body)
+                .with_context(|| format!("parsing async results from {results_uri}: {body}"))?;
+            let st = polled.status.as_deref().unwrap_or("");
+            if st.eq_ignore_ascii_case("succeeded") || (!polled.results.is_empty() && !st.eq_ignore_ascii_case("queued") && !st.eq_ignore_ascii_case("running")) {
+                return Ok(polled);
+            }
+            if st.eq_ignore_ascii_case("failed") {
+                return Err(anyhow!(
+                    "async transaction fetch failed: {} {}",
+                    polled.error.unwrap_or_default(),
+                    polled.error_description.unwrap_or_default()
+                ));
+            }
+            delay = (delay * 2).min(std::time::Duration::from_secs(3));
+        }
+        Err(anyhow!("async transaction fetch timed out at {results_uri}"))
     }
 
     // ---------- account endpoints ----------
@@ -187,14 +333,7 @@ impl TrueLayerClient {
         // Credit-card-only providers (e.g. Capital One) have no current accounts and return
         // 501 "endpoint_not_supported" here. That must NOT fail the whole sync — their data
         // lives under /cards, which is fetched next. Mirror get_cards' tolerance.
-        let url = format!("{DATA_BASE}/accounts");
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&token)
-            .header("Accept", "application/json")
-            .send()
-            .await?;
+        let resp = self.send_get(&token, "accounts").await?;
         if resp.status().as_u16() == 501 || resp.status().as_u16() == 403 {
             tracing::debug!("accounts endpoint not supported by provider; skipping (card-only?)");
             return Ok(vec![]);
@@ -213,14 +352,7 @@ impl TrueLayerClient {
     pub async fn get_cards(&self, db: &Db, c: &Consent) -> Result<Vec<TLCard>> {
         let token = self.fresh_access_token(db, c).await?;
         // some providers return 501 here if cards scope unavailable; treat gracefully.
-        let url = format!("{DATA_BASE}/cards");
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&token)
-            .header("Accept", "application/json")
-            .send()
-            .await?;
+        let resp = self.send_get(&token, "cards").await?;
         if resp.status().as_u16() == 501 || resp.status().as_u16() == 403 {
             tracing::debug!("cards endpoint not supported by provider; skipping");
             return Ok(vec![]);
@@ -249,8 +381,7 @@ impl TrueLayerClient {
         if let (Some(f), Some(t)) = (from, to) {
             path = format!("{path}?from={f}&to={t}");
         }
-        let resp: ApiResponse<TLTransaction> = self.get_json(&token, &path).await?;
-        Ok(resp.results)
+        self.fetch_transaction_pages(&token, &path).await
     }
 
     pub async fn get_account_balance(
@@ -291,23 +422,25 @@ impl TrueLayerClient {
     ) -> Result<Vec<TLTransaction>> {
         let token = self.fresh_access_token(db, c).await?;
         // Some banks return 501 if pending unsupported — fail gracefully.
-        let url = format!("{DATA_BASE}/accounts/{account_id}/transactions/pending");
         let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&token)
-            .header("Accept", "application/json")
-            .send()
+            .send_get(
+                &token,
+                &format!("accounts/{account_id}/transactions/pending"),
+            )
             .await?;
-        if !resp.status().is_success() {
-            tracing::debug!(
-                "pending transactions unavailable for {account_id} ({})",
-                resp.status()
-            );
+        let status = resp.status();
+        if status.as_u16() == 501 || status.as_u16() == 403 {
+            tracing::debug!("pending transactions unavailable for {account_id} ({status})");
             return Ok(vec![]);
         }
-        let body: ApiResponse<TLTransaction> = resp.json().await?;
-        Ok(body.results)
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "pending transactions failed for {account_id}: status {status}, body: {body}"
+            ));
+        }
+        let body: TxnPage = resp.json().await?;
+        Ok(Self::parse_transaction_values(body.results))
     }
 
     pub async fn get_card_transactions(
@@ -323,8 +456,7 @@ impl TrueLayerClient {
         if let (Some(f), Some(t)) = (from, to) {
             path = format!("{path}?from={f}&to={t}");
         }
-        let resp: ApiResponse<TLTransaction> = self.get_json(&token, &path).await?;
-        Ok(resp.results)
+        self.fetch_transaction_pages(&token, &path).await
     }
 
     pub async fn get_card_pending(
@@ -334,19 +466,21 @@ impl TrueLayerClient {
         card_id: &str,
     ) -> Result<Vec<TLTransaction>> {
         let token = self.fresh_access_token(db, c).await?;
-        let url = format!("{DATA_BASE}/cards/{card_id}/transactions/pending");
         let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&token)
-            .header("Accept", "application/json")
-            .send()
+            .send_get(&token, &format!("cards/{card_id}/transactions/pending"))
             .await?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if status.as_u16() == 501 || status.as_u16() == 403 || !status.is_success() {
+            if status.as_u16() == 429 {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow!(
+                    "card pending failed for {card_id}: status {status}, body: {body}"
+                ));
+            }
             return Ok(vec![]);
         }
-        let body: ApiResponse<TLTransaction> = resp.json().await?;
-        Ok(body.results)
+        let body: TxnPage = resp.json().await?;
+        Ok(Self::parse_transaction_values(body.results))
     }
 
     pub async fn get_standing_orders(
@@ -356,13 +490,8 @@ impl TrueLayerClient {
         account_id: &str,
     ) -> Result<Vec<TLStandingOrder>> {
         let token = self.fresh_access_token(db, c).await?;
-        let url = format!("{DATA_BASE}/accounts/{account_id}/standing_orders");
         let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&token)
-            .header("Accept", "application/json")
-            .send()
+            .send_get(&token, &format!("accounts/{account_id}/standing_orders"))
             .await?;
         if !resp.status().is_success() {
             return Ok(vec![]);
@@ -378,13 +507,8 @@ impl TrueLayerClient {
         account_id: &str,
     ) -> Result<Vec<TLDirectDebit>> {
         let token = self.fresh_access_token(db, c).await?;
-        let url = format!("{DATA_BASE}/accounts/{account_id}/direct_debits");
         let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&token)
-            .header("Accept", "application/json")
-            .send()
+            .send_get(&token, &format!("accounts/{account_id}/direct_debits"))
             .await?;
         if !resp.status().is_success() {
             return Ok(vec![]);

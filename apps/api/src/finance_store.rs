@@ -316,6 +316,17 @@ impl Db {
         crate::db::map_rows(rows).await
     }
 
+    pub async fn list_all_valuations(&self) -> Result<Vec<ValuationSnapshot>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM valuation_snapshots ORDER BY valuation_date ASC, id ASC",
+                (),
+            )
+            .await?;
+        crate::db::map_rows(rows).await
+    }
+
     pub async fn get_valuation(&self, id: i64) -> Result<Option<ValuationSnapshot>> {
         let rows = self
             .conn

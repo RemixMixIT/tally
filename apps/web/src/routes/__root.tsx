@@ -13,6 +13,8 @@ import {
   LayoutDashboard,
   ReceiptText,
   FolderTree,
+  ListFilter,
+  ArrowLeftRight,
   Wallet,
   CalendarClock,
   Landmark,
@@ -24,6 +26,8 @@ import {
   Scale,
   PieChart,
   Sparkles,
+  BarChart3,
+  Target,
 } from "lucide-react";
 
 export const Route = createRootRouteWithContext<{
@@ -86,10 +90,28 @@ function RootLayout() {
             Dashboard
           </NavItem>
           <NavItem
+            to="/expenditure"
+            icon={<BarChart3 className="size-[18px]" />}
+          >
+            Expenditure
+          </NavItem>
+          <NavItem
             to="/transactions"
             icon={<ReceiptText className="size-[18px]" />}
           >
             Transactions
+          </NavItem>
+          <NavItem
+            to="/review"
+            icon={<ListFilter className="size-[18px]" />}
+          >
+            Review
+          </NavItem>
+          <NavItem
+            to="/transfers"
+            icon={<ArrowLeftRight className="size-[18px]" />}
+          >
+            Transfers
           </NavItem>
           <NavItem
             to="/categories"
@@ -104,7 +126,7 @@ function RootLayout() {
             to="/bills"
             icon={<CalendarClock className="size-[18px]" />}
           >
-            Bills
+            Regular payments
           </NavItem>
           <NavItem to="/reminders" icon={<AlarmClock className="size-[18px]" />}>
             Reminders
@@ -120,6 +142,9 @@ function RootLayout() {
           </NavItem>
           <NavItem to="/net-worth" icon={<PieChart className="size-[18px]" />}>
             Net worth
+          </NavItem>
+          <NavItem to="/retirement" icon={<Target className="size-[18px]" />}>
+            Retirement
           </NavItem>
           <NavItem to="/forecasts" icon={<Sparkles className="size-[18px]" />}>
             Forecasts

@@ -6,6 +6,14 @@ export function formatGbp(amount: number, currency: string = "GBP"): string {
   }).format(amount);
 }
 
+export function displayPayee(t: {
+  payee?: string | null;
+  merchant_name: string | null;
+  description: string;
+}): string {
+  return (t.payee && t.payee.trim()) || t.merchant_name || t.description;
+}
+
 export function formatMoney(cents: number, currency: string = "GBP"): string {
   const n = cents / 100;
   return new Intl.NumberFormat("en-GB", {

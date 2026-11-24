@@ -3,6 +3,8 @@ import {
   ITEM_CLASSES,
   classLabel,
   holdingsAllowed,
+  holdingCostGbp,
+  isCashHolding,
   isLiabilityClass,
   matchesItemFilters,
   parseOptionalNumber,
@@ -38,6 +40,49 @@ describe("finance helpers", () => {
     expect(holdingsAllowed("investment")).toBe(true);
     expect(holdingsAllowed("cash")).toBe(false);
     expect(holdingsAllowed("property")).toBe(false);
+  });
+
+  it("converts register holding cost into GBP", () => {
+    expect(
+      holdingCostGbp({
+        cost_basis: 5892.52,
+        currency: "GBP",
+        native_value: 6235.28,
+        gbp_value: 6235.28,
+      })
+    ).toBeCloseTo(5892.52);
+    expect(
+      holdingCostGbp({
+        cost_basis: 6282.06,
+        currency: "USD",
+        native_value: 5800,
+        gbp_value: 4295.42,
+      })
+    ).toBeCloseTo(6282.06 * (4295.42 / 5800));
+    expect(
+      holdingCostGbp({
+        cost_basis: null,
+        currency: "GBP",
+        native_value: 100,
+        gbp_value: 100,
+      })
+    ).toBeNull();
+    expect(
+      holdingCostGbp({
+        cost_basis: null,
+        currency: "GBP",
+        native_value: 12441.58,
+        gbp_value: 12441.58,
+        ticker_or_identifier: "CASH",
+        holding_name: "AJ Bell SIPP cash",
+      })
+    ).toBeCloseTo(12441.58);
+    expect(
+      isCashHolding({ ticker_or_identifier: "CASH", holding_name: "AJ Bell SIPP cash" })
+    ).toBe(true);
+    expect(isCashHolding({ ticker_or_identifier: "LLY", holding_name: "Eli Lilly" })).toBe(
+      false
+    );
   });
 
   it("treats mortgage and tax as liabilities", () => {

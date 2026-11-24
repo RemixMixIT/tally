@@ -10,15 +10,16 @@
 //!  - Pull standing orders + direct debits → tally `recurring` + auto-promote to `bills`
 //!  - Write a sync_log row throughout
 
+use crate::bill_match::{self, CompiledBill};
 use crate::clients::truelayer::TrueLayerClient;
 use crate::db::Db;
 use crate::models::truelayer::*;
 use crate::models::Consent;
+use crate::learn::LearnEngine;
 use crate::notifier::Notifier;
 use crate::rules::{self, CompiledRules};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
-use regex::Regex;
 use tracing::{debug, error, info, warn};
 
 pub struct Importer {
@@ -57,26 +58,27 @@ impl Importer {
             }
         };
 
-        // Compile rules once for the whole sync.
+        // Compile rules once for the whole sync. Learned mapping is derived from
+        // existing categorised rows (rules still win when they set a category).
         let rules_raw = self.db.list_rules(true).await.unwrap_or_default();
         let compiled_rules = CompiledRules::compile(rules_raw);
+        let mut learned = LearnEngine::from_db(&self.db)
+            .await
+            .unwrap_or_else(|_| LearnEngine::from_parts(Vec::new(), &[]));
 
-        // Pre-compile bill match regexes.
         let bills = self.db.list_bills().await.unwrap_or_default();
-        let bill_matchers: Vec<(i64, Option<Regex>)> = bills
-            .iter()
-            .map(|b| {
-                let re = b
-                    .match_description_regex
-                    .as_ref()
-                    .and_then(|s| Regex::new(&format!("(?i){s}")).ok());
-                (b.id, re)
-            })
-            .collect();
+        let bill_matchers = bill_match::compile(&bills);
 
         for tl_acc in &tl_accounts {
             if let Err(e) = self
-                .sync_account(consent, tl_acc, &compiled_rules, &bill_matchers, &mut result)
+                .sync_account(
+                    consent,
+                    tl_acc,
+                    &compiled_rules,
+                    &mut learned,
+                    &bill_matchers,
+                    &mut result,
+                )
                 .await
             {
                 let msg = format!(
@@ -91,7 +93,14 @@ impl Importer {
 
         for tl_card in &tl_cards {
             if let Err(e) = self
-                .sync_card(consent, tl_card, &compiled_rules, &bill_matchers, &mut result)
+                .sync_card(
+                    consent,
+                    tl_card,
+                    &compiled_rules,
+                    &mut learned,
+                    &bill_matchers,
+                    &mut result,
+                )
                 .await
             {
                 let msg = format!(
@@ -176,12 +185,125 @@ impl Importer {
         Ok((accounts, cards))
     }
 
+    /// UK Open Banking allows ~90 days of transactions without a fresh SCA.
+    /// Banks treat `from` as start-of-day, so a calendar `now - 90 days` is often
+    /// *more* than 90×24h ago and Tide returns 403 `UK.OBIE.Reauthenticate`.
+    /// Cap at 88 days (TrueLayer's default) and don't surface that 403 as a
+    /// failed sync when a shorter window already succeeded (including empty).
+    async fn fetch_posted_transactions(
+        &self,
+        consent: &Consent,
+        kind: &str,
+        provider_id: &str,
+        label: &str,
+        result: &mut SyncResult,
+    ) -> Vec<crate::models::truelayer::TLTransaction> {
+        let to = Utc::now().date_naive().format("%Y-%m-%d").to_string();
+        let mut last_error: Option<String> = None;
+        let mut any_success = false;
+        // 31d covers recent activity; 88d is the max history without re-auth.
+        for days in [31i64, 88] {
+            let from = posted_txn_from_date(days);
+            let fetched = if kind == "card" {
+                self.tl
+                    .get_card_transactions(&self.db, consent, provider_id, Some(&from), Some(&to))
+                    .await
+            } else {
+                self.tl
+                    .get_account_transactions(
+                        &self.db,
+                        consent,
+                        provider_id,
+                        Some(&from),
+                        Some(&to),
+                    )
+                    .await
+            };
+            match fetched {
+                Ok(txns) => {
+                    info!(
+                        consent = %consent.nickname,
+                        account = label,
+                        days,
+                        n = txns.len(),
+                        "fetched posted transactions"
+                    );
+                    any_success = true;
+                    if !txns.is_empty() {
+                        return txns;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        consent = %consent.nickname,
+                        account = label,
+                        days,
+                        "posted transactions failed: {e:#}"
+                    );
+                    if error_is_rate_limited(&e) {
+                        result
+                            .errors
+                            .push(format!("{label} transactions ({days}d): {e:#}"));
+                        return Vec::new();
+                    }
+                    if error_is_from_date_expired(&e) {
+                        if !any_success {
+                            last_error = Some(format!("{label} transactions ({days}d): {e:#}"));
+                        }
+                        break;
+                    }
+                    last_error = Some(format!("{label} transactions ({days}d): {e:#}"));
+                }
+            }
+        }
+        if !any_success {
+            if let Some(err) = last_error {
+                result.errors.push(err);
+            }
+        }
+        Vec::new()
+    }
+
+    async fn fetch_pending_transactions(
+        &self,
+        consent: &Consent,
+        kind: &str,
+        provider_id: &str,
+        label: &str,
+        result: &mut SyncResult,
+    ) -> Vec<crate::models::truelayer::TLTransaction> {
+        let fetched = if kind == "card" {
+            self.tl.get_card_pending(&self.db, consent, provider_id).await
+        } else {
+            self.tl
+                .get_account_pending(&self.db, consent, provider_id)
+                .await
+        };
+        match fetched {
+            Ok(txns) => txns,
+            Err(e) => {
+                warn!(
+                    consent = %consent.nickname,
+                    account = label,
+                    "pending transactions failed: {e:#}"
+                );
+                if error_is_rate_limited(&e) {
+                    result
+                        .errors
+                        .push(format!("{label} pending transactions: {e:#}"));
+                }
+                Vec::new()
+            }
+        }
+    }
+
     async fn sync_account(
         &self,
         consent: &Consent,
         tl: &TLAccount,
         rules: &CompiledRules,
-        bill_matchers: &[(i64, Option<Regex>)],
+        learned: &mut LearnEngine,
+        bill_matchers: &[CompiledBill],
         result: &mut SyncResult,
     ) -> Result<()> {
         let iban = tl.account_number.as_ref().and_then(|n| n.iban.clone());
@@ -237,26 +359,33 @@ impl Importer {
             Err(e) => debug!("balance fetch failed for {}: {e:#}", tl.account_id),
         }
 
-        // Posted + pending — 90-day rolling window. Banks expose ~90 days after the first hour
-        // post-consent; the wider window lets monthly direct debits land in history so we can
-        // backfill the DD amount/date that TrueLayer leaves null on the mandate itself.
-        let to_date = Utc::now().format("%Y-%m-%d").to_string();
-        let from_date = (Utc::now() - Duration::days(90)).format("%Y-%m-%d").to_string();
         let posted = self
-            .tl
-            .get_account_transactions(&self.db, consent, &tl.account_id, Some(&from_date), Some(&to_date))
-            .await
-            .unwrap_or_default();
+            .fetch_posted_transactions(consent, "account", &tl.account_id, &display_name, result)
+            .await;
         let pending = self
-            .tl
-            .get_account_pending(&self.db, consent, &tl.account_id)
-            .await
-            .unwrap_or_default();
+            .fetch_pending_transactions(consent, "account", &tl.account_id, &display_name, result)
+            .await;
 
-        self.persist_transactions(&account, posted, false, rules, bill_matchers, result)
-            .await;
-        self.persist_transactions(&account, pending, true, rules, bill_matchers, result)
-            .await;
+        self.persist_transactions(
+            &account,
+            posted,
+            false,
+            rules,
+            learned,
+            bill_matchers,
+            result,
+        )
+        .await;
+        self.persist_transactions(
+            &account,
+            pending,
+            true,
+            rules,
+            learned,
+            bill_matchers,
+            result,
+        )
+        .await;
 
         // Standing orders + direct debits → tally `recurring` + auto-promote to bills.
         let sos = self
@@ -322,7 +451,16 @@ impl Importer {
             } else {
                 r.name.clone()
             };
-            self.upsert_bill_for_recurring(r.id, &display_name, &r.name, amount_cents, currency, freq, next_ts)
+            self.upsert_bill_for_recurring(
+                r.id,
+                account.id,
+                &display_name,
+                &r.name,
+                amount_cents,
+                currency,
+                freq,
+                next_ts,
+            )
                 .await;
         }
     }
@@ -332,7 +470,8 @@ impl Importer {
         consent: &Consent,
         tl: &TLCard,
         rules: &CompiledRules,
-        bill_matchers: &[(i64, Option<Regex>)],
+        learned: &mut LearnEngine,
+        bill_matchers: &[CompiledBill],
         result: &mut SyncResult,
     ) -> Result<()> {
         let display_name = tl
@@ -405,23 +544,33 @@ impl Importer {
             Err(e) => debug!("card balance fetch failed for {}: {e:#}", tl.account_id),
         }
 
-        let to_date = Utc::now().format("%Y-%m-%d").to_string();
-        let from_date = (Utc::now() - Duration::days(30)).format("%Y-%m-%d").to_string();
         let posted = self
-            .tl
-            .get_card_transactions(&self.db, consent, &tl.account_id, Some(&from_date), Some(&to_date))
-            .await
-            .unwrap_or_default();
+            .fetch_posted_transactions(consent, "card", &tl.account_id, &display_name, result)
+            .await;
         let pending = self
-            .tl
-            .get_card_pending(&self.db, consent, &tl.account_id)
-            .await
-            .unwrap_or_default();
+            .fetch_pending_transactions(consent, "card", &tl.account_id, &display_name, result)
+            .await;
 
-        self.persist_transactions(&account, posted, false, rules, bill_matchers, result)
-            .await;
-        self.persist_transactions(&account, pending, true, rules, bill_matchers, result)
-            .await;
+        self.persist_transactions(
+            &account,
+            posted,
+            false,
+            rules,
+            learned,
+            bill_matchers,
+            result,
+        )
+        .await;
+        self.persist_transactions(
+            &account,
+            pending,
+            true,
+            rules,
+            learned,
+            bill_matchers,
+            result,
+        )
+        .await;
 
         Ok(())
     }
@@ -432,7 +581,8 @@ impl Importer {
         txns: Vec<TLTransaction>,
         is_pending: bool,
         rules: &CompiledRules,
-        bill_matchers: &[(i64, Option<Regex>)],
+        learned: &mut LearnEngine,
+        bill_matchers: &[CompiledBill],
         result: &mut SyncResult,
     ) {
         for txn in txns {
@@ -490,11 +640,15 @@ impl Importer {
                 category_id: None,
                 notes: None,
                 raw_json: None,
+                transfer_pair_id: None,
+                transfer_unmatchable: 0,
+                transfer_await_account_id: None,
                 created_at: 0,
                 updated_at: 0,
             };
 
-            // Rule application — may set category, tags, notes.
+            // Rules first; learned unanimous history fills in when no rule set a category.
+            let (category_id, _) = learned.category_for_new(&pseudo, rules);
             let eff = rules::apply(&pseudo, rules);
 
             // Insert.
@@ -512,7 +666,7 @@ impl Importer {
                     txn.merchant_name.as_deref(),
                     cp_iban.as_deref(),
                     cp_name.as_deref(),
-                    eff.set_category_id,
+                    category_id,
                     eff.set_notes.as_deref(),
                     raw_json.as_deref(),
                 )
@@ -528,6 +682,14 @@ impl Importer {
                 }
             };
 
+            if let Some(cid) = category_id {
+                learned.observe(txn.merchant_name.as_deref(), &txn.description, cid);
+            }
+
+            if let Err(e) = crate::pairs::on_new_transaction(&self.db, new_id).await {
+                warn!("pair/await for txn {new_id}: {e:#}");
+            }
+
             // Mark dedup so future syncs don't reprocess.
             let _ = self
                 .db
@@ -542,20 +704,21 @@ impl Importer {
                 let _ = self.db.bump_rule_applied(*rid).await;
             }
 
-            // Try to link this transaction to a matching bill.
-            if !is_credit {
-                for (bill_id, re_opt) in bill_matchers {
-                    let Some(re) = re_opt.as_ref() else { continue };
-                    if re.is_match(&txn.description)
-                        || re.is_match(txn.merchant_name.as_deref().unwrap_or(""))
-                    {
-                        let _ = self
-                            .db
-                            .mark_bill_paid_by_transaction(*bill_id, new_id, ts)
-                            .await;
-                    }
-                }
-            }
+            // Link in-window / unknown-amount regulars. Out-of-window amounts stay
+            // unlinked for the amount-exception prompt.
+            let _ = self
+                .db
+                .auto_link_bill_if_matched(
+                    bill_matchers,
+                    account.id,
+                    new_id,
+                    &txn.description,
+                    txn.merchant_name.as_deref(),
+                    amount_cents,
+                    is_credit,
+                    ts,
+                )
+                .await;
 
             result.transactions_imported += 1;
             self.notifier
@@ -608,7 +771,16 @@ impl Importer {
             .await?;
         result.recurring_imported += 1;
 
-        self.upsert_bill_for_recurring(entry.id, &name, &name, amount_cents, currency, freq, next_ts)
+        self.upsert_bill_for_recurring(
+            entry.id,
+            account.id,
+            &name,
+            &name,
+            amount_cents,
+            currency,
+            freq,
+            next_ts,
+        )
             .await;
         Ok(())
     }
@@ -659,7 +831,16 @@ impl Importer {
         result.recurring_imported += 1;
 
         let display_name = format!("{name} (DD)");
-        self.upsert_bill_for_recurring(entry.id, &display_name, &name, amount_cents, currency, "monthly", next_ts)
+        self.upsert_bill_for_recurring(
+            entry.id,
+            account.id,
+            &display_name,
+            &name,
+            amount_cents,
+            currency,
+            "monthly",
+            next_ts,
+        )
             .await;
         Ok(())
     }
@@ -686,6 +867,7 @@ impl Importer {
     async fn upsert_bill_for_recurring(
         &self,
         recurring_id: i64,
+        account_id: i64,
         display_name: &str,
         match_name: &str,
         amount_cents: Option<i64>,
@@ -699,7 +881,11 @@ impl Importer {
         };
         match self.db.bill_id_for_recurring(recurring_id).await {
             Ok(Some(bid)) => {
-                if let Err(e) = self.db.update_bill_schedule(bid, min, max, next_ts).await {
+                if let Err(e) = self
+                    .db
+                    .update_bill_schedule(bid, min, max, next_ts, Some(account_id))
+                    .await
+                {
                     debug!("update bill {bid} for recurring {recurring_id} failed: {e:#}");
                 }
             }
@@ -707,7 +893,18 @@ impl Importer {
                 let regex = Some(escape_for_regex(match_name));
                 match self
                     .db
-                    .create_bill(display_name, min, max, currency, freq, next_ts, regex.as_deref(), Some(recurring_id))
+                    .create_bill(
+                        display_name,
+                        min,
+                        max,
+                        currency,
+                        freq,
+                        next_ts,
+                        regex.as_deref(),
+                        Some(recurring_id),
+                        Some(account_id),
+                        false,
+                    )
                     .await
                 {
                     Ok(bid) => {
@@ -718,6 +915,51 @@ impl Importer {
             }
             Err(e) => debug!("bill_id_for_recurring lookup failed: {e:#}"),
         }
+    }
+}
+
+fn error_is_rate_limited(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}").to_ascii_lowercase();
+    msg.contains("status 429")
+        || msg.contains("too_many_requests")
+        || msg.contains("request_limit")
+        || msg.contains("provider_too_many_requests")
+}
+
+fn error_is_from_date_expired(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}").to_ascii_lowercase();
+    msg.contains("fromdatelong")
+        || msg.contains("uk.obie.reauthenticate")
+        || (msg.contains("re-auth") && msg.contains("90 days"))
+}
+
+/// Inclusive start-of-day `from` must stay strictly inside 90 days or Tide 403s.
+fn posted_txn_from_date(days: i64) -> String {
+    let days = days.clamp(1, 88);
+    (Utc::now().date_naive() - Duration::days(days))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+#[cfg(test)]
+mod fetch_window_tests {
+    use super::*;
+
+    #[test]
+    fn posted_from_date_never_exceeds_88_days() {
+        let from = posted_txn_from_date(90);
+        let parsed = chrono::NaiveDate::parse_from_str(&from, "%Y-%m-%d").unwrap();
+        let today = Utc::now().date_naive();
+        assert!((today - parsed).num_days() <= 88);
+    }
+
+    #[test]
+    fn detects_obie_from_date_reauth() {
+        let e = anyhow::anyhow!(
+            "status 403 Forbidden, body: expected_fromDateLong_expired UK.OBIE.Reauthenticate"
+        );
+        assert!(error_is_from_date_expired(&e));
+        assert!(!error_is_rate_limited(&e));
     }
 }
 

@@ -444,6 +444,8 @@ function HistoryTable({ valuations }: { valuations: ValuationSnapshot[] }) {
             <th className="text-left px-4 py-2.5">Date</th>
             <th className="text-right px-4 py-2.5">Native</th>
             <th className="text-right px-4 py-2.5">GBP</th>
+            <th className="text-right px-4 py-2.5">In</th>
+            <th className="text-right px-4 py-2.5">Out</th>
             <th className="text-left px-4 py-2.5">Source</th>
             <th className="text-left px-4 py-2.5">Confidence</th>
           </tr>
@@ -457,6 +459,12 @@ function HistoryTable({ valuations }: { valuations: ValuationSnapshot[] }) {
               </td>
               <td className="px-4 py-2.5 text-right mono font-semibold">
                 {formatGbp(v.gbp_value)}
+              </td>
+              <td className="px-4 py-2.5 text-right mono">
+                {v.contributions == null ? "—" : formatGbp(v.contributions)}
+              </td>
+              <td className="px-4 py-2.5 text-right mono">
+                {v.withdrawals == null ? "—" : formatGbp(v.withdrawals)}
               </td>
               <td className="px-4 py-2.5 text-mid">
                 {v.source_type}
@@ -473,7 +481,7 @@ function HistoryTable({ valuations }: { valuations: ValuationSnapshot[] }) {
           ))}
           {!valuations.length && (
             <tr>
-              <td colSpan={5} className="px-4 py-6 text-mid text-center">
+              <td colSpan={7} className="px-4 py-6 text-mid text-center">
                 No snapshots yet.
               </td>
             </tr>

@@ -37,6 +37,45 @@ pub(crate) async fn map_opt<T: FromLibsqlRow>(mut rows: libsql::Rows) -> Result<
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CsvDescMatch {
+    Exact,
+    Prefix,
+    None,
+}
+
+fn csv_desc_key(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn csv_description_match(a: &str, b: &str) -> CsvDescMatch {
+    let a = csv_desc_key(a);
+    let b = csv_desc_key(b);
+    if a.is_empty() || b.is_empty() {
+        return if a == b {
+            CsvDescMatch::Exact
+        } else {
+            CsvDescMatch::None
+        };
+    }
+    if a == b {
+        return CsvDescMatch::Exact;
+    }
+    let (short, long) = if a.len() <= b.len() {
+        (a.as_str(), b.as_str())
+    } else {
+        (b.as_str(), a.as_str())
+    };
+    if long.starts_with(short) && long.as_bytes().get(short.len()) == Some(&b' ') {
+        CsvDescMatch::Prefix
+    } else {
+        CsvDescMatch::None
+    }
+}
+
 impl Db {
     /// Connect to the configured database. The connection mode is chosen by the URL scheme of
     /// `database_url` (the value of `TALLY_DATABASE_URL`):
@@ -464,6 +503,41 @@ impl Db {
             .context("manual account disappeared after insert")
     }
 
+    pub async fn account_by_truelayer_id(&self, truelayer_id: &str) -> Result<Option<Account>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM accounts WHERE truelayer_id = ?1 LIMIT 1",
+                params![truelayer_id],
+            )
+            .await?;
+        map_opt(rows).await
+    }
+
+    /// Transfer ledger for a net-worth item (e.g. Global Prime). No current
+    /// balance — net worth still comes from the item's valuation snapshot.
+    pub async fn create_item_ledger_account(
+        &self,
+        name: &str,
+        currency: &str,
+        truelayer_id: &str,
+    ) -> Result<Account> {
+        let now = Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO accounts (
+                    consent_id, truelayer_id, kind, display_name, currency, enabled,
+                    created_at, updated_at, account_type
+                 ) VALUES (NULL, ?1, 'account', ?2, ?3, 1, ?4, ?5, 'trading_account')",
+                params![truelayer_id, name, currency, now, now],
+            )
+            .await?;
+        let id = self.conn.last_insert_rowid();
+        self.get_account(id)
+            .await?
+            .context("item ledger account disappeared after insert")
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_account(
         &self,
@@ -601,6 +675,34 @@ impl Db {
         Ok(())
     }
 
+    /// Set statement snapshot only. Does not touch current/available/limit. Applied when
+    /// this statement date is on or after the stored one (backfill keeps the latest).
+    pub async fn update_last_statement(
+        &self,
+        account_id: i64,
+        last_statement_balance_cents: i64,
+        last_statement_date: &str,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE accounts SET
+                    last_statement_balance_cents = ?1,
+                    last_statement_date = ?2,
+                    updated_at = ?3
+                 WHERE id = ?4
+                   AND (last_statement_date IS NULL OR last_statement_date <= ?2)",
+                params![
+                    last_statement_balance_cents,
+                    last_statement_date,
+                    now,
+                    account_id,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// One-off metadata bump separate from `upsert_account` (which would otherwise need 14 params).
     /// If `account_type` is already a user-chosen canonical type, it is left alone so a TrueLayer
     /// sync cannot clobber an edit made from the Banks dropdown.
@@ -663,6 +765,16 @@ impl Db {
         Ok(())
     }
 
+    pub async fn set_funding_slack_cents(&self, account_id: i64, slack_cents: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE accounts SET funding_slack_cents = ?1, updated_at = ?2 WHERE id = ?3",
+                params![slack_cents.max(0), Utc::now().timestamp(), account_id],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// User-overridable label that wins over TrueLayer's display_name in the UI. Pass None
     /// to clear back to TL-provided.
     pub async fn set_account_custom_display_name(
@@ -699,9 +811,11 @@ impl Db {
 
     // ---------- transactions_seen ----------
 
-    /// Account-scoped CSV/manual dedup: same calendar date + amount + description.
-    /// TrueLayer imports keep using `provider_txn_id` / `transactions_seen`; this is the
-    /// fallback when a re-exported CSV hashes differently (e.g. a changed Balance column).
+    /// Account-scoped CSV/manual dedup: same calendar date + amount + direction, and a
+    /// normalised description (collapsed whitespace; one may be a prefix of the other so
+    /// `John Lancaster` matches `John Lancaster HOUSEHOLD`). TrueLayer imports keep using
+    /// `provider_txn_id` / `transactions_seen`; this is the fallback when a re-exported CSV
+    /// hashes differently (e.g. a changed Balance column or a bank suffix).
     pub async fn find_matching_transaction(
         &self,
         account_id: i64,
@@ -713,26 +827,34 @@ impl Db {
         let mut rows = self
             .conn
             .query(
-                "SELECT id FROM transactions
+                "SELECT id, description FROM transactions
                  WHERE account_id = ?1
                    AND date(timestamp, 'unixepoch') = date(?2, 'unixepoch')
-                   AND description = ?3
-                   AND amount_cents = ?4
-                   AND is_credit = ?5
-                 LIMIT 1",
+                   AND amount_cents = ?3
+                   AND is_credit = ?4",
                 params![
                     account_id,
                     timestamp,
-                    description,
                     amount_cents,
                     if is_credit { 1_i64 } else { 0 },
                 ],
             )
             .await?;
-        match rows.next().await? {
-            Some(row) => Ok(Some(row.get::<i64>(0)?)),
-            None => Ok(None),
+        let mut exact: Option<i64> = None;
+        let mut prefix: Option<i64> = None;
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            let existing: String = row.get(1)?;
+            match csv_description_match(description, &existing) {
+                CsvDescMatch::Exact => {
+                    exact = Some(id);
+                    break;
+                }
+                CsvDescMatch::Prefix if prefix.is_none() => prefix = Some(id),
+                CsvDescMatch::Prefix | CsvDescMatch::None => {}
+            }
         }
+        Ok(exact.or(prefix))
     }
 
     pub async fn is_txn_seen(&self, account_id: i64, truelayer_txn_id: &str) -> Result<bool> {
@@ -1046,6 +1168,177 @@ impl Db {
         Ok(())
     }
 
+    pub async fn list_unpaired_in_window(
+        &self,
+        exclude_id: i64,
+        exclude_account_id: i64,
+        exclude_is_credit: i64,
+        from_ts: i64,
+        to_ts: i64,
+    ) -> Result<Vec<Transaction>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM transactions
+                 WHERE id != ?1
+                   AND account_id != ?2
+                   AND is_credit != ?3
+                   AND transfer_pair_id IS NULL
+                   AND transfer_unmatchable = 0
+                   AND transfer_await_account_id IS NULL
+                   AND timestamp >= ?4 AND timestamp <= ?5
+                 ORDER BY timestamp",
+                params![exclude_id, exclude_account_id, exclude_is_credit, from_ts, to_ts],
+            )
+            .await?;
+        map_rows(rows).await
+    }
+
+    /// Candidates for the Transfers page: paired, Transfer-tree, uncategorised, or keyword-like.
+    /// Callers still apply `is_transfer_like` so groceries in the uncategorised set are dropped.
+    pub async fn list_transfer_scan(&self, transfer_category_ids: &[i64]) -> Result<Vec<Transaction>> {
+        let mut q = String::from(
+            "SELECT * FROM transactions WHERE (
+                transfer_pair_id IS NOT NULL
+                OR category_id IS NULL
+                OR lower(description) LIKE '%transfer%'
+                OR lower(description) LIKE '%top-up%'
+                OR lower(description) LIKE '%top up%'
+                OR lower(description) LIKE '%topup%'
+                OR lower(description) LIKE '%vrp%'
+                OR lower(description) LIKE '%converted%'
+                OR lower(description) LIKE '% tfr %'
+                OR lower(description) LIKE 'tfr %'
+                OR lower(description) = 'tfr'
+                OR lower(coalesce(merchant_name, '')) LIKE '%transfer%'
+                OR lower(coalesce(merchant_name, '')) LIKE '%top-up%'
+                OR lower(coalesce(merchant_name, '')) LIKE '%top up%'
+                OR lower(coalesce(merchant_name, '')) LIKE '%topup%'
+                OR lower(coalesce(merchant_name, '')) LIKE '%vrp%'
+                OR lower(coalesce(merchant_name, '')) LIKE '%converted%'",
+        );
+        let mut binds: Vec<Value> = Vec::new();
+        if !transfer_category_ids.is_empty() {
+            let p = vec!["?"; transfer_category_ids.len()].join(",");
+            q.push_str(&format!(" OR category_id IN ({p})"));
+            binds.extend(transfer_category_ids.iter().map(|v| Value::from(*v)));
+        }
+        q.push_str(") ORDER BY timestamp DESC");
+        let rows = self.conn.query(&q, binds).await?;
+        map_rows(rows).await
+    }
+
+    /// Existing pairs: (this account, this description, the other account).
+    /// Used so the next `SMILE RENTS HOUSEHOLD` prefers Smile again.
+    pub async fn list_paired_counterparts(&self) -> Result<Vec<(i64, String, i64)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT t.account_id, t.description, o.account_id
+                 FROM transactions t
+                 JOIN transactions o ON o.id = t.transfer_pair_id
+                 WHERE t.transfer_pair_id IS NOT NULL",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push((row.get(0)?, row.get(1)?, row.get(2)?));
+        }
+        Ok(out)
+    }
+
+    pub async fn set_transfer_pair(&self, a: i64, b: i64, category_id: i64) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE transactions
+                 SET transfer_pair_id = ?2, category_id = ?3, transfer_unmatchable = 0,
+                     transfer_await_account_id = NULL, updated_at = ?4
+                 WHERE id = ?1",
+                params![a, b, category_id, now],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "UPDATE transactions
+                 SET transfer_pair_id = ?2, category_id = ?3, transfer_unmatchable = 0,
+                     transfer_await_account_id = NULL, updated_at = ?4
+                 WHERE id = ?1",
+                params![b, a, category_id, now],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_transfer_unmatchable(&self, id: i64, unmatchable: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE transactions
+                 SET transfer_unmatchable = ?1,
+                     transfer_await_account_id = CASE WHEN ?1 = 1 THEN NULL ELSE transfer_await_account_id END,
+                     updated_at = ?2
+                 WHERE id = ?3",
+                params![if unmatchable { 1_i64 } else { 0 }, Utc::now().timestamp(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_transfer_await(
+        &self,
+        id: i64,
+        account_id: i64,
+        category_id: i64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE transactions
+                 SET transfer_await_account_id = ?1, category_id = ?2,
+                     transfer_unmatchable = 0, updated_at = ?3
+                 WHERE id = ?4",
+                params![account_id, category_id, Utc::now().timestamp(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn clear_transfer_await(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE transactions SET transfer_await_account_id = NULL, updated_at = ?1 WHERE id = ?2",
+                params![Utc::now().timestamp(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_waiting_transfers(&self) -> Result<Vec<Transaction>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM transactions
+                 WHERE transfer_await_account_id IS NOT NULL
+                   AND transfer_pair_id IS NULL
+                   AND transfer_unmatchable = 0
+                 ORDER BY timestamp DESC",
+                (),
+            )
+            .await?;
+        map_rows(rows).await
+    }
+
+    pub async fn clear_transfer_pair(&self, a: i64, b: i64) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE transactions SET transfer_pair_id = NULL, updated_at = ?2 WHERE id IN (?1, ?3)",
+                params![a, now, b],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn update_transaction_notes(&self, id: i64, notes: Option<&str>) -> Result<()> {
         self.conn
             .execute(
@@ -1172,20 +1465,123 @@ impl Db {
         from_ts: i64,
         to_ts: i64,
     ) -> Result<Vec<(Option<i64>, i64)>> {
-        // Sum of withdrawal amounts per category in date range.
+        // Sum of withdrawal amounts per category in date range. Transfer parent/leaves
+        // are excluded so internal movements don't inflate spend.
+        let cats = self.list_categories().await.unwrap_or_default();
+        let skip = crate::learn::transfer_tree_ids(&cats);
         let mut rows = self
             .conn
             .query(
                 "SELECT category_id, SUM(amount_cents) AS total_cents
                  FROM transactions
                  WHERE timestamp >= ?1 AND timestamp <= ?2 AND is_credit = 0
+                   AND transfer_pair_id IS NULL
                  GROUP BY category_id",
                 params![from_ts, to_ts],
             )
             .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            out.push((row.get::<Option<i64>>(0)?, row.get::<i64>(1)?));
+            let cid = row.get::<Option<i64>>(0)?;
+            if let Some(id) = cid {
+                if skip.contains(&id) {
+                    continue;
+                }
+            }
+            out.push((cid, row.get::<i64>(1)?));
+        }
+        Ok(out)
+    }
+
+    /// Transaction + account + category rows for the personal expenditure average.
+    /// The calculator skips pending, transfers, business, and income.
+    pub async fn list_spend_source_rows(&self) -> Result<Vec<crate::expenditure::SpendRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT t.timestamp, t.amount_cents, t.currency, t.is_credit, t.is_pending,
+                        t.transfer_pair_id,
+                        a.display_name, a.custom_display_name,
+                        c.name, p.name
+                 FROM transactions t
+                 INNER JOIN accounts a ON a.id = t.account_id
+                 LEFT JOIN categories c ON c.id = t.category_id
+                 LEFT JOIN categories p ON p.id = c.parent_id",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(crate::expenditure::SpendRow {
+                timestamp: row.get(0)?,
+                amount_cents: row.get(1)?,
+                currency: row.get(2)?,
+                is_credit: row.get(3)?,
+                is_pending: row.get(4)?,
+                transfer_pair_id: row.get(5)?,
+                display_name: row.get(6)?,
+                custom_display_name: row.get(7)?,
+                category_name: row.get(8)?,
+                parent_name: row.get(9)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Merchant + description + category for every categorised transaction.
+    /// Used to build the payee-history map (no separate mapping table).
+    pub async fn list_payee_history(&self) -> Result<Vec<(Option<String>, String, i64)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT merchant_name, description, category_id
+                 FROM transactions
+                 WHERE category_id IS NOT NULL",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push((
+                row.get::<Option<String>>(0)?,
+                row.get::<String>(1)?,
+                row.get::<i64>(2)?,
+            ));
+        }
+        Ok(out)
+    }
+
+    pub async fn list_uncategorised_transactions(&self) -> Result<Vec<Transaction>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT * FROM transactions WHERE category_id IS NULL ORDER BY timestamp DESC",
+                (),
+            )
+            .await?;
+        map_rows(rows).await
+    }
+
+    pub async fn list_account_display_names(&self) -> Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT display_name, custom_display_name FROM accounts",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let display: String = row.get(0)?;
+            let custom: Option<String> = row.get(1)?;
+            if let Some(c) = custom {
+                if !c.trim().is_empty() {
+                    out.push(c);
+                }
+            }
+            if !display.trim().is_empty() {
+                out.push(display);
+            }
         }
         Ok(out)
     }
@@ -1457,7 +1853,8 @@ impl Db {
             .conn
             .query(
                 "SELECT SUM(amount_cents) FROM transactions
-                 WHERE category_id IS ?1 AND is_credit = 0 AND timestamp >= ?2 AND timestamp <= ?3",
+                 WHERE category_id IS ?1 AND is_credit = 0 AND timestamp >= ?2 AND timestamp <= ?3
+                   AND transfer_pair_id IS NULL",
                 params![budget.category_id, from, to],
             )
             .await?;
@@ -1504,14 +1901,16 @@ impl Db {
         next_expected_date: Option<i64>,
         match_description_regex: Option<&str>,
         source_recurring_id: Option<i64>,
+        account_id: Option<i64>,
+        is_inflow: bool,
     ) -> Result<i64> {
         let now = Utc::now().timestamp();
         self.conn
             .execute(
                 "INSERT INTO bills (name, expected_amount_min_cents, expected_amount_max_cents,
                     currency, repeat_freq, next_expected_date, match_description_regex,
-                    source_recurring_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    source_recurring_id, account_id, is_inflow, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     name,
                     amount_min_cents,
@@ -1521,6 +1920,8 @@ impl Db {
                     next_expected_date,
                     match_description_regex,
                     source_recurring_id,
+                    account_id,
+                    if is_inflow { 1_i64 } else { 0 },
                     now,
                     now,
                 ],
@@ -1552,23 +1953,35 @@ impl Db {
         }
     }
 
+    pub async fn get_bill(&self, id: i64) -> Result<Option<Bill>> {
+        let rows = self
+            .conn
+            .query("SELECT * FROM bills WHERE id = ?1", params![id])
+            .await?;
+        map_opt(rows).await
+    }
+
     /// Update an existing bill's expected amount window + projected next date. Used on re-sync
     /// when we've inferred a fresher amount/date for a DD from transaction history.
+    /// `account_id` fills only if the bill has none yet, so a user override is kept.
     pub async fn update_bill_schedule(
         &self,
         id: i64,
         amount_min_cents: i64,
         amount_max_cents: i64,
         next_expected_date: Option<i64>,
+        account_id: Option<i64>,
     ) -> Result<()> {
         self.conn
             .execute(
                 "UPDATE bills SET expected_amount_min_cents = ?1, expected_amount_max_cents = ?2,
-                    next_expected_date = ?3, updated_at = ?4 WHERE id = ?5",
+                    next_expected_date = ?3, account_id = COALESCE(account_id, ?4),
+                    updated_at = ?5 WHERE id = ?6",
                 params![
                     amount_min_cents,
                     amount_max_cents,
                     next_expected_date,
+                    account_id,
                     Utc::now().timestamp(),
                     id,
                 ],
@@ -1613,6 +2026,9 @@ impl Db {
         next_expected_date: Option<i64>,
         match_description_regex: Option<&str>,
         enabled: Option<bool>,
+        account_id: Option<i64>,
+        is_inflow: Option<bool>,
+        repeat_freq: Option<&str>,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
         self.conn
@@ -1624,8 +2040,11 @@ impl Db {
                     next_expected_date = COALESCE(?4, next_expected_date),
                     match_description_regex = COALESCE(?5, match_description_regex),
                     enabled = COALESCE(?6, enabled),
-                    updated_at = ?7
-                 WHERE id = ?8",
+                    account_id = COALESCE(?7, account_id),
+                    is_inflow = COALESCE(?8, is_inflow),
+                    repeat_freq = COALESCE(?9, repeat_freq),
+                    updated_at = ?10
+                 WHERE id = ?11",
                 params![
                     name,
                     amount_min_cents,
@@ -1633,6 +2052,9 @@ impl Db {
                     next_expected_date,
                     match_description_regex,
                     enabled.map(|b| if b { 1_i64 } else { 0 }),
+                    account_id,
+                    is_inflow.map(|b| if b { 1_i64 } else { 0 }),
+                    repeat_freq,
                     now,
                     id,
                 ],
@@ -2172,6 +2594,8 @@ impl Db {
         bill_id: i64,
         transaction_id: i64,
         paid_ts: i64,
+        update_expected_amount: bool,
+        payment_amount_cents: i64,
     ) -> Result<()> {
         self.conn
             .execute(
@@ -2198,14 +2622,140 @@ impl Db {
         let next = freq
             .as_deref()
             .map(|f| advance_past(paid_ts, f, Utc::now().timestamp()));
-        self.conn
-            .execute(
-                "UPDATE bills SET last_paid_date = ?1, next_expected_date = COALESCE(?2, next_expected_date),
-                    updated_at = ?3 WHERE id = ?4",
-                params![paid_ts, next, Utc::now().timestamp(), bill_id],
+        if update_expected_amount {
+            let (min, max) = crate::bill_match::window_from_amount(payment_amount_cents);
+            self.conn
+                .execute(
+                    "UPDATE bills SET last_paid_date = ?1, next_expected_date = COALESCE(?2, next_expected_date),
+                        expected_amount_min_cents = ?3, expected_amount_max_cents = ?4,
+                        updated_at = ?5 WHERE id = ?6",
+                    params![paid_ts, next, min, max, Utc::now().timestamp(), bill_id],
+                )
+                .await?;
+        } else {
+            self.conn
+                .execute(
+                    "UPDATE bills SET last_paid_date = ?1, next_expected_date = COALESCE(?2, next_expected_date),
+                        updated_at = ?3 WHERE id = ?4",
+                    params![paid_ts, next, Utc::now().timestamp(), bill_id],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn bill_payment_exists(&self, bill_id: i64, transaction_id: i64) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM bill_payments WHERE bill_id = ?1 AND transaction_id = ?2 LIMIT 1",
+                params![bill_id, transaction_id],
             )
             .await?;
-        Ok(())
+        Ok(rows.next().await?.is_some())
+    }
+
+    pub async fn last_bill_payment(&self, bill_id: i64) -> Result<Option<(i64, i64)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT t.amount_cents, t.timestamp FROM bill_payments bp
+                 JOIN transactions t ON t.id = bp.transaction_id
+                 WHERE bp.bill_id = ?1
+                 ORDER BY t.timestamp DESC LIMIT 1",
+                params![bill_id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some((row.get::<i64>(0)?, row.get::<i64>(1)?))),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn last_bill_payment_amount(&self, bill_id: i64) -> Result<Option<i64>> {
+        Ok(self.last_bill_payment(bill_id).await?.map(|(cents, _)| cents))
+    }
+
+    /// Latest debit/credit on `account_id` whose description or merchant matches `pattern`.
+    /// Returns `(amount_cents, timestamp)`. Used for variable regulars so funding can
+    /// tell an unpaid card statement from last month's Smile payment.
+    pub async fn last_matching_txn(
+        &self,
+        account_id: i64,
+        is_inflow: bool,
+        pattern: &str,
+    ) -> Result<Option<(i64, i64)>> {
+        let Ok(regex) = regex::Regex::new(&format!("(?i){pattern}")) else {
+            return Ok(None);
+        };
+        let is_credit = if is_inflow { 1_i64 } else { 0 };
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT amount_cents, timestamp, description, merchant_name FROM transactions
+                 WHERE account_id = ?1 AND is_credit = ?2
+                 ORDER BY timestamp DESC LIMIT 400",
+                params![account_id, is_credit],
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let amount: i64 = row.get(0)?;
+            let ts: i64 = row.get(1)?;
+            let desc: String = row.get(2)?;
+            let merchant: Option<String> = row.get(3)?;
+            if regex.is_match(&desc)
+                || merchant
+                    .as_deref()
+                    .map(|m| regex.is_match(m))
+                    .unwrap_or(false)
+            {
+                return Ok(Some((amount, ts)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn last_matching_txn_amount(
+        &self,
+        account_id: i64,
+        is_inflow: bool,
+        pattern: &str,
+    ) -> Result<Option<i64>> {
+        Ok(self
+            .last_matching_txn(account_id, is_inflow, pattern)
+            .await?
+            .map(|(cents, _)| cents))
+    }
+
+    /// Auto-link in-window (or unknown-amount) matches. Out-of-window hits are left
+    /// unlinked for the amount-exception UI.
+    pub async fn auto_link_bill_if_matched(
+        &self,
+        matchers: &[crate::bill_match::CompiledBill],
+        account_id: i64,
+        txn_id: i64,
+        description: &str,
+        merchant: Option<&str>,
+        amount_cents: i64,
+        is_credit: bool,
+        ts: i64,
+    ) -> Result<Option<i64>> {
+        match crate::bill_match::decide(
+            matchers,
+            account_id,
+            description,
+            merchant,
+            amount_cents,
+            is_credit,
+            ts,
+        ) {
+            crate::bill_match::MatchDecision::Auto { bill_id } => {
+                self.mark_bill_paid_by_transaction(bill_id, txn_id, ts, false, amount_cents)
+                    .await?;
+                Ok(Some(bill_id))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
@@ -2648,6 +3198,26 @@ mod roundtrip_tests {
             .await
             .unwrap();
         assert_eq!(later, hit);
+        // Bank suffix on a re-export must not mint a second row.
+        db.upsert_transaction(
+            a1.id, "csv:190", ts, "John Lancaster", 250_000, "GBP", true, false,
+            None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+        let suffix = db
+            .find_matching_transaction(a1.id, ts, "John Lancaster HOUSEHOLD", 250_000, true)
+            .await
+            .unwrap();
+        assert!(suffix.is_some());
+        assert_eq!(
+            csv_description_match("John Lancaster", "John Lancaster HOUSEHOLD"),
+            CsvDescMatch::Prefix
+        );
+        assert_eq!(
+            csv_description_match("Payment", "Payments"),
+            CsvDescMatch::None
+        );
     }
 
     #[tokio::test]
@@ -2695,5 +3265,49 @@ mod roundtrip_tests {
             .unwrap();
         let after = db.get_account(a.id).await.unwrap().unwrap();
         assert_eq!(after.account_type.as_deref(), Some("CURRENT_ACCOUNT"));
+    }
+
+    #[tokio::test]
+    async fn last_matching_txn_amount_picks_latest_debit() {
+        let db = test_db().await;
+        let c = db
+            .upsert_consent("smile", "creds", None, None, "at", "rt", 1, None, "accounts")
+            .await
+            .unwrap();
+        let a = db
+            .upsert_account(c.id, "acc", "transaction", "Smile", None, None, None, None, "GBP")
+            .await
+            .unwrap();
+        db.upsert_transaction(
+            a.id, "v1", 1_000, "VANQUIS BANK", 244_694, "GBP", false, false, None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+        db.upsert_transaction(
+            a.id, "v2", 2_000, "VANQUIS BANK", 127_978, "GBP", false, false, None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+        db.upsert_transaction(
+            a.id, "k", 3_000, "KCOM GROUP LTD", 4_099, "GBP", false, false, None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+        let amt = db
+            .last_matching_txn_amount(a.id, false, "VANQUIS")
+            .await
+            .unwrap();
+        assert_eq!(amt, Some(127_978));
+        let pair = db
+            .last_matching_txn(a.id, false, "VANQUIS")
+            .await
+            .unwrap();
+        assert_eq!(pair, Some((127_978, 2_000)));
+        assert_eq!(
+            db.last_matching_txn_amount(a.id, false, "NOPE")
+                .await
+                .unwrap(),
+            None
+        );
     }
 }

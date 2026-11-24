@@ -219,6 +219,23 @@ items, and transactions are excluded. Bank and broker figures are latest balance
 historical reconstructions. `GET /api/net-worth` and `GET /api/net-worth/explanation` return
 counted, excluded, and unreconciled lines.
 
+### Batty valuation feed
+
+SIPP (and Global Prime equity when present) can be updated from
+`tally_valuations.csv`, produced on Batty and published to Google Drive
+`_outbound/tally/`. Speed copies that file into `data/inbound/` with rclone;
+the container reads `/app/inbound/tally_valuations.csv` on a 15-minute
+scheduler (and once at startup). The SIPP account total is the AJ Bell SIPP
+roll-up row; child holding rows attach to that item and are not counted twice.
+USD amounts arrive already converted. A Global Prime login omitted from the
+file is left unchanged (never written as £0). ISA is not in this feed.
+Roll-up rows include `contributions` and `withdrawals` for that valuation
+date (`0.00` is stored as zero, not unknown). Child holding rows leave those
+cells blank. Same-day feed refreshes replace that day's cashflow on the
+existing `batty-feed` snapshot; a new date inserts history.
+`POST /api/valuation-feed/import` (authenticated) runs the import
+immediately; `?force=true` ignores the unchanged-file fingerprint.
+
 The existing `/api/holdings` broker/Yahoo API is unchanged. Item-level holdings are nested under
 `/api/financial-items/:id/holdings` and updated via `/api/item-holdings/:id` so they cannot
 collide with broker holding deletes.
@@ -227,7 +244,47 @@ Rollback of 0014 is unsupported (same as every prior tally migration). Restore a
 SQLite backup if you need to undo.
 
 UI: **Assets** (`/valuations` — not `/assets`, which is the SPA JS bundle folder),
-**Net worth**, property and mortgage detail pages, and **Forecasts**.
+**Net worth**, **Retirement** (`/retirement` — 2030 TMS income test, not forecasts),
+property and mortgage detail pages, and **Forecasts**.
+
+## Vanquis statement PDFs
+
+Vanquis has no Open Banking feed. Speed copies monthly PDFs from Dropbox into
+`data/inbound/vanquis/`; the container imports them onto the Vanquis card
+account and the host script files a successful drop onto OneDrive.
+
+| | Path |
+|---|---|
+| Drop | `Dropbox\!Inbox\Documents\Vanquis Statements` (and `Inbox\` under it) |
+| rclone drop | `dropbox:!Inbox/Documents/Vanquis Statements` |
+| Archive | `OneDrive\Documents\Financial\Vanquis Statements\YYYYMM -MonthlyStatement.pdf` |
+| rclone archive | `onedrive:Documents/Financial/Vanquis Statements` |
+
+Cron on Speed (`*/15`) runs `scripts/sync-tally-vanquis-statements.sh`. Re-dropping
+an already-imported statement does not duplicate rows; the Dropbox copy is still
+removed and OneDrive is not overwritten. A parse failure leaves the file in
+Dropbox for the next run. Statement lines dated before 2025 are not stored.
+`POST /internal/vanquis/import` (loopback) runs the import immediately.
+
+## Capital on Tap statement PDFs
+
+Capital on Tap has no Open Banking feed. Speed copies monthly PDFs from Dropbox
+into `data/inbound/capital-on-tap/`; the container imports them onto the existing
+Capital On Tap card account and the host script files a successful drop onto
+OneDrive.
+
+| | Path |
+|---|---|
+| Drop | `Dropbox\!Inbox\Documents\CapitalOnTap Statements` (folder root only) |
+| rclone drop | `dropbox:!Inbox/Documents/CapitalOnTap Statements` |
+| Archive | `OneDrive\Documents\Financial\CapitalOnTap Statements\YYYYMM -MonthlyStatement.pdf` |
+| rclone archive | `onedrive:Documents/Financial/CapitalOnTap Statements` |
+
+`YYYYMM` is the statement period end on the PDF. Cron on Speed (`*/15`) runs
+`scripts/sync-tally-capital-on-tap-statements.sh`. Re-dropping an already-imported
+statement does not duplicate rows; the Dropbox copy is still removed and OneDrive
+is not overwritten. A parse failure leaves the file in Dropbox for the next run.
+`POST /internal/capital-on-tap/import` (loopback) runs the import immediately.
 
 ## Build from source
 

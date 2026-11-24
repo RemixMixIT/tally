@@ -390,6 +390,41 @@ pub async fn list_item_holdings(
     Ok(Json(json!({ "holdings": holdings, "total_gbp": total })))
 }
 
+pub async fn list_register_holdings(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let items = state.db.list_financial_items().await.map_err(internal)?;
+    let all = state
+        .db
+        .list_all_item_holdings()
+        .await
+        .map_err(internal)?;
+    let mut by_item: std::collections::HashMap<i64, Vec<crate::models::InvestmentHolding>> =
+        std::collections::HashMap::new();
+    for h in all {
+        by_item.entry(h.financial_item_id).or_default().push(h);
+    }
+    let mut groups = Vec::new();
+    for item in items {
+        if item.is_active != 1 {
+            continue;
+        }
+        let Some(holdings) = by_item.remove(&item.id) else {
+            continue;
+        };
+        if holdings.is_empty() {
+            continue;
+        }
+        let total_gbp: f64 = holdings.iter().map(|h| h.gbp_value).sum();
+        groups.push(json!({
+            "item": item,
+            "holdings": holdings,
+            "total_gbp": total_gbp,
+        }));
+    }
+    Ok(Json(json!({ "groups": groups })))
+}
+
 pub async fn create_item_holding(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -860,6 +895,33 @@ pub async fn net_worth_history(
         })
         .collect();
     Ok(Json(json!({ "points": points })))
+}
+
+pub async fn retirement(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let items = state.db.list_financial_items().await.map_err(internal)?;
+    let snaps = state.db.list_all_valuations().await.map_err(internal)?;
+    let as_of = chrono::Utc::now().date_naive();
+    let report = crate::retirement::build_report(&items, &snaps, as_of);
+    Ok(Json(json!({ "retirement": report })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ValuationFeedQuery {
+    #[serde(default)]
+    pub force: bool,
+}
+
+pub async fn import_valuation_feed(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ValuationFeedQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let path = crate::valuation_feed::feed_path();
+    let report = crate::valuation_feed::import_path(&state.db, &path, q.force)
+        .await
+        .map_err(http_err)?;
+    Ok(Json(json!({ "report": report })))
 }
 
 #[cfg(test)]

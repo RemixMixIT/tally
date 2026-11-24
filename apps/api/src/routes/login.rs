@@ -11,7 +11,8 @@ use crate::auth_backend::{AuthSession, Credentials};
 use crate::ratelimit;
 use crate::AppState;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use std::net::SocketAddr;
 use axum::Json;
 use base64::Engine;
@@ -35,7 +36,7 @@ static TRUST_PROXY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
 /// Client IP for rate-limiting keys: the TCP peer address, unless a trusted proxy is
 /// declared — then the last X-Forwarded-For entry (the hop the proxy itself appended;
 /// earlier entries are client-supplied and forgeable).
-fn client_ip(addr: &SocketAddr, headers: &HeaderMap) -> String {
+pub(crate) fn client_ip(addr: &SocketAddr, headers: &HeaderMap) -> String {
     if *TRUST_PROXY {
         if let Some(ip) = headers
             .get("x-forwarded-for")
@@ -263,15 +264,23 @@ pub async fn recovery(
     Ok(Json(json!({ "ok": true })))
 }
 
-pub async fn logout(mut auth_session: AuthSession) -> Result<Json<Value>, (StatusCode, String)> {
+pub async fn logout(mut auth_session: AuthSession) -> Result<impl IntoResponse, (StatusCode, String)> {
     auth_session.logout().await.map_err(internal)?;
-    Ok(Json(json!({ "ok": true })))
+    let mut res = Json(json!({ "ok": true })).into_response();
+    // Hub cookie is shared across *.remixmix.co.uk; clear it so one sign-out covers all apps.
+    if let Ok(value) = "queeg_session=deleted; Domain=.remixmix.co.uk; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+        .parse()
+    {
+        res.headers_mut().append(header::SET_COOKIE, value);
+    }
+    Ok(res)
 }
 
 pub async fn me(
     State(state): State<Arc<AppState>>,
     session: Session,
     auth_session: AuthSession,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let setup_required = auth::count_users(&state.db).await.unwrap_or(0) == 0;
     if setup_required {
@@ -289,6 +298,15 @@ pub async fn me(
             "setup_required": false,
         }))),
         None => {
+            if let Some(user) = crate::queeg_sso::user_from_headers(state.as_ref(), &headers).await {
+                return Ok(Json(json!({
+                    "authenticated": true,
+                    "awaiting_2fa": false,
+                    "totp_enrolled": user.totp_enrolled == 1,
+                    "username": user.username,
+                    "setup_required": false,
+                })));
+            }
             let pending: Option<i64> = session.get(PENDING_2FA_KEY).await.unwrap_or(None);
             Ok(Json(json!({
                 "authenticated": false,

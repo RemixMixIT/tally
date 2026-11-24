@@ -53,7 +53,7 @@ RUN strip target/release/tally
 # ---- runtime --------------------------------------------------------------
 FROM debian:bookworm-slim@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f2068983107a6f6c21eeb AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl \
+    ca-certificates curl poppler-utils \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 tally \
     && useradd --uid 1000 --gid tally --shell /bin/bash --create-home tally

@@ -5,6 +5,7 @@ export async function invalidatePortfolio(qc: QueryClient) {
   await Promise.all([
     qc.invalidateQueries({ queryKey: ["holdings"], refetchType: "all" }),
     qc.invalidateQueries({ queryKey: ["holdings-net-worth"], refetchType: "all" }),
+    qc.invalidateQueries({ queryKey: ["register-holdings"], refetchType: "all" }),
   ]);
   // Chart / net-worth hit Yahoo history — don't block the form on them.
   void qc.invalidateQueries({ queryKey: ["portfolio-history"], refetchType: "all" });

@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
+import { CategorySelect } from "@/components/CategorySelect";
 import { api } from "@/lib/api";
 import { formatMoney } from "@/lib/format";
 import type { Budget, BudgetStatus, Category } from "@/types/api";
@@ -75,20 +76,13 @@ function BudgetsPage() {
           value={amount}
           onChange={(e) => setAmount(e.target.value)}
         />
-        <select
+        <CategorySelect
           className="input"
+          categories={cats.data?.categories ?? []}
           value={category}
-          onChange={(e) =>
-            setCategory(e.target.value ? Number(e.target.value) : "")
-          }
-        >
-          <option value="">All spending</option>
-          {cats.data?.categories.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.name}
-            </option>
-          ))}
-        </select>
+          onChange={(id) => setCategory(id ?? "")}
+          emptyLabel="All spending"
+        />
         <select
           className="input"
           value={period}

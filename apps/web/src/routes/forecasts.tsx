@@ -112,8 +112,19 @@ function ForecastsPage() {
         </table>
       </section>
       <p className="text-xs text-mid">
-        Actuals live on <Link to="/valuations" className="text-green">assets</Link> and{" "}
-        <Link to="/net-worth" className="text-green">net worth</Link>.
+        Actuals live on{" "}
+        <Link to="/valuations" className="text-green">
+          assets
+        </Link>{" "}
+        and{" "}
+        <Link to="/net-worth" className="text-green">
+          net worth
+        </Link>
+        . The 2030 income test is on{" "}
+        <Link to="/retirement" className="text-green">
+          retirement
+        </Link>
+        .
       </p>
     </div>
   );

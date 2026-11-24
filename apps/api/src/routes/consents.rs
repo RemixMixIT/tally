@@ -1,14 +1,43 @@
 use crate::importer::Importer;
 use crate::AppState;
 use askama::Template;
-use axum::extract::{Form, Path, State};
+use axum::extract::{ConnectInfo, Form, Path, State};
+use axum::http::HeaderMap;
 use axum::response::{Html, Redirect};
 use axum::Json;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use std::sync::Arc;
+
+/// Best-effort end-user IP for TrueLayer `X-PSU-IP`. Prefers the rate-limit
+/// client IP; if that's loopback (local reverse proxy with TRUST_PROXY unset),
+/// fall back to X-Real-IP / X-Forwarded-For so a tap of Sync now is still
+/// treated as attended by the bank.
+fn sync_psu_ip(addr: &SocketAddr, headers: &HeaderMap) -> Option<String> {
+    let peer = crate::routes::login::client_ip(addr, headers);
+    if let Some(ip) = crate::clients::truelayer::usable_psu_ip(peer) {
+        return Some(ip);
+    }
+    if let Some(ip) = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| crate::clients::truelayer::usable_psu_ip(s.to_string()))
+    {
+        return Some(ip);
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next_back())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| crate::clients::truelayer::usable_psu_ip(s.to_string()))
+}
 
 #[derive(Template)]
 #[template(path = "consents.html")]
@@ -59,14 +88,17 @@ pub async fn create(
 pub async fn sync_one(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Redirect {
     let consent = match state.db.get_consent(id).await {
         Ok(Some(c)) => c,
         _ => return Redirect::to("/?error=consent_not_found"),
     };
+    let psu = sync_psu_ip(&addr, &headers);
     let importer = Importer {
         db: state.db.clone(),
-        tl: state.tl.clone(),
+        tl: state.tl.with_psu_ip(psu),
         notifier: state.notifier.clone(),
         ai: state.ai.clone(),
     };
@@ -81,13 +113,18 @@ pub async fn sync_one(
 
 /// POST /api/sync — trigger a background sync of every enabled consent. Returns immediately
 /// with how many syncs were kicked off; the dashboard then refetches once they land.
-pub async fn sync_all(State(state): State<Arc<AppState>>) -> Json<Value> {
+pub async fn sync_all(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Json<Value> {
     let consents = state.db.list_consents().await.unwrap_or_default();
     let mut triggered = 0;
+    let psu = sync_psu_ip(&addr, &headers);
     for consent in consents.into_iter().filter(|c| c.enabled == 1) {
         let importer = Importer {
             db: state.db.clone(),
-            tl: state.tl.clone(),
+            tl: state.tl.with_psu_ip(psu.clone()),
             notifier: state.notifier.clone(),
             ai: state.ai.clone(),
         };

@@ -106,7 +106,9 @@ function BanksPage() {
   });
 
   const allAccounts = accounts.data?.accounts ?? [];
-  const manualAccounts = allAccounts.filter((a) => a.consent_id == null);
+  const manualAccounts = allAccounts.filter(
+    (a) => a.consent_id == null && !a.truelayer_id.startsWith("item:")
+  );
   const linkedAccounts = allAccounts.filter((a) => a.consent_id != null);
 
   // Group linked (Open Banking) accounts by consent for the cards.

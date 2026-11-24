@@ -10,10 +10,12 @@ import {
   TrendingDown,
 } from "lucide-react";
 import { api, type ApiError } from "@/lib/api";
-import { formatMoney } from "@/lib/format";
+import { formatGbp, formatMoney } from "@/lib/format";
+import { holdingCostGbp, isCashHolding } from "@/lib/finance";
 import { invalidatePortfolio } from "@/lib/portfolio-queries";
 import { SymbolCombobox, type SymbolHit } from "@/components/SymbolCombobox";
 import { PortfolioChart } from "@/components/PortfolioChart";
+import type { ItemHolding, RegisterHoldingGroup } from "@/types/api";
 
 export const Route = createFileRoute("/investments")({ component: InvestmentsPage });
 
@@ -56,6 +58,10 @@ function InvestmentsPage() {
     queryKey: ["holdings"],
     queryFn: () => api.get<{ holdings: EnrichedHolding[] }>("/api/holdings"),
   });
+  const register = useQuery({
+    queryKey: ["register-holdings"],
+    queryFn: () => api.get<{ groups: RegisterHoldingGroup[] }>("/api/register-holdings"),
+  });
   const netWorth = useQuery({
     queryKey: ["holdings-net-worth"],
     queryFn: () =>
@@ -75,19 +81,32 @@ function InvestmentsPage() {
   const [showAddBroker, setShowAddBroker] = useState(false);
   const [showAddHolding, setShowAddHolding] = useState(false);
 
-  const market = netWorth.data?.holdings_market_value ?? 0;
-  const cost = netWorth.data?.holdings_cost_basis ?? 0;
-  const gain = netWorth.data?.holdings_unrealised_gain ?? 0;
+  const registerHoldings = (register.data?.groups ?? []).flatMap((g) =>
+    g.holdings.map((h) => ({ group: g, holding: h }))
+  );
+  const registerMarket = (register.data?.groups ?? []).reduce(
+    (s, g) => s + g.total_gbp,
+    0
+  );
+  const registerCost = registerHoldings.reduce((s, row) => {
+    const c = holdingCostGbp(row.holding);
+    return s + (c ?? 0);
+  }, 0);
+  const market = (netWorth.data?.holdings_market_value ?? 0) + registerMarket;
+  const cost = (netWorth.data?.holdings_cost_basis ?? 0) + registerCost;
+  const gain = market - cost;
   const gainPct = cost > 0 ? (gain / cost) * 100 : 0;
   const positive = gain >= 0;
-  // Pick the dominant currency from the holdings list so the totals don't render in £
-  // when everything is USD. If holdings span multiple currencies we fall back to "" and
-  // leave formatMoney to use its default — a multi-currency aggregate would need FX.
+  const brokerList = holdings.data?.holdings ?? [];
+  const hasBrokerHoldings = brokerList.length > 0;
+  const hasRegisterHoldings = registerHoldings.length > 0;
+  // Register holdings are GBP-reported. Only use a single native currency for broker
+  // totals when there are no register rows mixed in.
   const dominantCurrency = (() => {
-    const list = holdings.data?.holdings ?? [];
-    if (list.length === 0) return undefined;
-    const ccys = new Set(list.map((x) => x.holding.currency));
-    return ccys.size === 1 ? list[0].holding.currency : undefined;
+    if (hasRegisterHoldings) return "GBP";
+    if (brokerList.length === 0) return undefined;
+    const ccys = new Set(brokerList.map((x) => x.holding.currency));
+    return ccys.size === 1 ? brokerList[0].holding.currency : undefined;
   })();
 
   return (
@@ -98,7 +117,9 @@ function InvestmentsPage() {
             <em>Investments</em>
           </h1>
           <p className="text-mid text-sm">
-            Manual holdings across all your brokers.
+            Broker activity plus register holdings. SIPP positions come from the
+            Batty feed and are not copied into the broker book, so net worth
+            counts them once.
           </p>
         </div>
         <button
@@ -152,7 +173,8 @@ function InvestmentsPage() {
         </div>
       </section>
 
-      {/* Portfolio history chart */}
+      {/* Portfolio history chart — Yahoo only knows broker activity. */}
+      {hasBrokerHoldings && (
       <section className="card p-7 fade-in-2">
         <div className="flex items-baseline justify-between mb-4">
           <h2 className="text-2xl">
@@ -164,6 +186,7 @@ function InvestmentsPage() {
         </div>
         <PortfolioChart showRangePicker height={320} />
       </section>
+      )}
 
       {/* Brokers list */}
       <section className="fade-in-3">
@@ -181,7 +204,10 @@ function InvestmentsPage() {
           {brokers.data?.brokers.map((b) => (
             <BrokerCard key={b.id} broker={b} />
           ))}
-          {!brokers.data?.brokers.length && (
+          {(register.data?.groups ?? []).map((g) => (
+            <RegisterAccountCard key={`reg-${g.item.id}`} group={g} />
+          ))}
+          {!brokers.data?.brokers.length && !hasRegisterHoldings && (
             <p className="text-sm text-mid col-span-full">
               No brokers yet. Add Lightyear or AJ Bell to get started.
             </p>
@@ -211,6 +237,7 @@ function InvestmentsPage() {
             <thead className="bg-cream">
               <tr className="text-[11px] uppercase tracking-widest text-mid">
                 <th className="text-left px-4 py-2.5">Symbol</th>
+                <th className="text-left px-4 py-2.5">Account</th>
                 <th className="text-left px-4 py-2.5">Quantity</th>
                 <th className="text-right px-4 py-2.5">Avg cost</th>
                 <th className="text-right px-4 py-2.5">Price</th>
@@ -220,13 +247,29 @@ function InvestmentsPage() {
               </tr>
             </thead>
             <tbody>
-              {holdings.data?.holdings.map((h) => (
-                <HoldingRow key={h.holding.id} h={h} />
+              {registerHoldings.map(({ group, holding }) => (
+                <RegisterHoldingRow
+                  key={`reg-${holding.id}`}
+                  itemId={group.item.id}
+                  account={group.item.name}
+                  h={holding}
+                />
               ))}
-              {!holdings.data?.holdings.length && (
+              {brokerList.map((h) => (
+                <HoldingRow
+                  key={`brk-${h.holding.id}`}
+                  h={h}
+                  account={
+                    brokers.data?.brokers.find((b) => b.id === h.holding.broker_id)
+                      ?.name ?? "Broker"
+                  }
+                />
+              ))}
+              {!hasBrokerHoldings && !hasRegisterHoldings && (
                 <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center text-mid">
-                    No holdings yet. Add one above.
+                  <td colSpan={8} className="px-4 py-8 text-center text-mid">
+                    No holdings yet. SIPP positions appear here after the Batty
+                    feed import, or add broker activity above.
                   </td>
                 </tr>
               )}
@@ -235,6 +278,28 @@ function InvestmentsPage() {
         </div>
       </section>
     </div>
+  );
+}
+
+function RegisterAccountCard({ group }: { group: RegisterHoldingGroup }) {
+  const navigate = useNavigate();
+  return (
+    <button
+      type="button"
+      className="card p-4 text-left hover:bg-cream/60"
+      onClick={() =>
+        navigate({
+          to: "/valuations/$id",
+          params: { id: group.item.id.toString() },
+        })
+      }
+    >
+      <p className="font-extrabold tracking-tight">{group.item.name}</p>
+      <p className="text-[10px] uppercase tracking-widest text-mid mt-1">
+        {group.item.item_type} · Batty feed
+      </p>
+      <p className="mono text-sm mt-2">{formatGbp(group.total_gbp)}</p>
+    </button>
   );
 }
 
@@ -525,7 +590,7 @@ function AddActivityForm({ brokers, onDone }: { brokers: Broker[]; onDone: () =>
   );
 }
 
-function HoldingRow({ h }: { h: EnrichedHolding }) {
+function HoldingRow({ h, account }: { h: EnrichedHolding; account: string }) {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const del = useMutation({
@@ -546,6 +611,7 @@ function HoldingRow({ h }: { h: EnrichedHolding }) {
           {h.company_name || h.holding.name || ""}
         </p>
       </td>
+      <td className="px-4 py-3 text-[11px] text-mid">{account}</td>
       <td className="px-4 py-3 mono">{h.holding.quantity}</td>
       <td className="px-4 py-3 mono text-right text-mid">
         {h.holding.avg_cost_per_unit != null
@@ -617,6 +683,87 @@ function HoldingRow({ h }: { h: EnrichedHolding }) {
           title="Delete holding"
         >
           <Trash2 className="size-3.5" />
+        </button>
+      </td>
+    </tr>
+  );
+}
+
+function RegisterHoldingRow({
+  itemId,
+  account,
+  h,
+}: {
+  itemId: number;
+  account: string;
+  h: ItemHolding;
+}) {
+  const navigate = useNavigate();
+  const open = () =>
+    navigate({ to: "/valuations/$id", params: { id: itemId.toString() } });
+  const costGbp = holdingCostGbp(h);
+  const cash = isCashHolding(h);
+  const gain = cash || costGbp == null ? null : h.gbp_value - costGbp;
+  const gainPct = costGbp && costGbp > 0 && gain != null ? (gain / costGbp) * 100 : null;
+  const positive = (gain ?? 0) >= 0;
+  const symbol = h.ticker_or_identifier || h.holding_name;
+  return (
+    <tr
+      className="border-t border-thin hover:bg-cream/60 cursor-pointer"
+      onClick={open}
+    >
+      <td className="px-4 py-3">
+        <p className="mono font-semibold">{symbol}</p>
+        <p className="text-[11px] text-mid mt-0.5 truncate max-w-[180px]">
+          {h.holding_name}
+        </p>
+      </td>
+      <td className="px-4 py-3 text-[11px] text-mid">{account}</td>
+      <td className="px-4 py-3 mono">{h.units ?? "—"}</td>
+      <td className="px-4 py-3 mono text-right text-mid">
+        {cash
+          ? "—"
+          : h.cost_basis != null && h.units
+            ? (h.cost_basis / h.units).toFixed(2)
+            : h.cost_basis != null
+              ? h.cost_basis.toFixed(2)
+              : "—"}
+      </td>
+      <td className="px-4 py-3 mono text-right">
+        {h.price != null ? h.price.toFixed(2) : "—"}
+      </td>
+      <td className="px-4 py-3 mono text-right">{formatGbp(h.gbp_value)}</td>
+      <td className="px-4 py-3 mono text-right">
+        {gain != null ? (
+          <span
+            className={`inline-flex items-center gap-1 ${
+              positive ? "text-green" : "text-danger"
+            }`}
+          >
+            {positive ? (
+              <TrendingUp className="size-3" />
+            ) : (
+              <TrendingDown className="size-3" />
+            )}
+            {positive ? "+" : "−"}
+            {formatGbp(Math.abs(gain))}
+            {gainPct != null && (
+              <span className="text-[10px] text-mid">({gainPct.toFixed(1)}%)</span>
+            )}
+          </span>
+        ) : (
+          <span className="text-mid">—</span>
+        )}
+      </td>
+      <td className="px-4 py-3 text-right whitespace-nowrap">
+        <button
+          className="btn-secondary text-xs"
+          onClick={(e) => {
+            e.stopPropagation();
+            open();
+          }}
+        >
+          Open <ChevronRight className="size-3.5" />
         </button>
       </td>
     </tr>

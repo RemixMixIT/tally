@@ -110,6 +110,9 @@ impl AiClient {
         txn: &Transaction,
         categories: &[Category],
     ) -> Result<Option<i64>> {
+        if crate::learn::is_always_manual(txn.merchant_name.as_deref(), &txn.description) {
+            return Ok(None);
+        }
         let Some(api_key) = self.get_api_key().await? else {
             return Err(anyhow!("OpenRouter API key not configured"));
         };

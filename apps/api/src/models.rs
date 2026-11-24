@@ -168,6 +168,9 @@ pub struct Account {
     pub name_on_card: Option<String>,
     pub custom_display_name: Option<String>,
     pub balance_updated_at: Option<i64>,
+    /// Per-account buffer (pence) for the remaining-month funding forecast. Absent from
+    /// SELECTs that predate migration 0019 → 0.
+    pub funding_slack_cents: i64,
     // Not a column on `accounts` — populated by joins that select `c.nickname AS consent_nickname`
     // (e.g. the accounts list) so the UI can label tiles with the user's chosen bank nickname.
     // Absent from every non-join SELECT → resolved via get_opt_absent (=> None when missing).
@@ -208,6 +211,10 @@ impl FromLibsqlRow for Account {
             name_on_card: col!(c, row, "name_on_card"),
             custom_display_name: col!(c, row, "custom_display_name"),
             balance_updated_at: col!(c, row, "balance_updated_at"),
+            funding_slack_cents: match c.idx("funding_slack_cents") {
+                Some(i) => row.get::<Option<i64>>(i)?.unwrap_or(0),
+                None => 0,
+            },
             // Join-only columns: absent from most SELECTs → None.
             consent_nickname: col_opt!(c, row, "consent_nickname"),
             pending_net_cents: col_opt!(c, row, "pending_net_cents"),
@@ -342,6 +349,10 @@ pub struct Transaction {
     pub category_id: Option<i64>,
     pub notes: Option<String>,
     pub raw_json: Option<String>,
+    pub transfer_pair_id: Option<i64>,
+    #[serde(default)]
+    pub transfer_unmatchable: i64,
+    pub transfer_await_account_id: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -365,6 +376,12 @@ impl FromLibsqlRow for Transaction {
             category_id: col!(c, row, "category_id"),
             notes: col!(c, row, "notes"),
             raw_json: col!(c, row, "raw_json"),
+            transfer_pair_id: col_opt!(c, row, "transfer_pair_id"),
+            transfer_unmatchable: match c.idx("transfer_unmatchable") {
+                Some(i) => row.get::<i64>(i).unwrap_or(0),
+                None => 0,
+            },
+            transfer_await_account_id: col_opt!(c, row, "transfer_await_account_id"),
             created_at: col!(c, row, "created_at"),
             updated_at: col!(c, row, "updated_at"),
         })
@@ -624,6 +641,8 @@ pub struct Bill {
     pub match_description_regex: Option<String>,
     pub enabled: i64,
     pub source_recurring_id: Option<i64>,
+    pub account_id: Option<i64>,
+    pub is_inflow: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -643,6 +662,14 @@ impl FromLibsqlRow for Bill {
             match_description_regex: col!(c, row, "match_description_regex"),
             enabled: col!(c, row, "enabled"),
             source_recurring_id: col!(c, row, "source_recurring_id"),
+            account_id: match c.idx("account_id") {
+                Some(i) => row.get(i)?,
+                None => None,
+            },
+            is_inflow: match c.idx("is_inflow") {
+                Some(i) => row.get::<Option<i64>>(i)?.unwrap_or(0),
+                None => 0,
+            },
             created_at: col!(c, row, "created_at"),
             updated_at: col!(c, row, "updated_at"),
         })
@@ -955,8 +982,21 @@ pub mod truelayer {
     use serde::Deserialize;
 
     #[derive(Debug, Deserialize)]
+    #[serde(bound(deserialize = "T: Deserialize<'de>"))]
     pub struct ApiResponse<T> {
         pub results: Vec<T>,
+        #[serde(default)]
+        pub status: Option<String>,
+        #[serde(default)]
+        pub results_uri: Option<String>,
+        #[serde(default)]
+        pub links: Option<ApiLinks>,
+    }
+
+    #[derive(Debug, Deserialize, Clone, Default)]
+    pub struct ApiLinks {
+        #[serde(default)]
+        pub next: Option<String>,
     }
 
     #[derive(Debug, Deserialize, Clone)]
@@ -1054,13 +1094,36 @@ pub mod truelayer {
         pub update_timestamp: Option<String>,
     }
 
+    fn deserialize_amount<'de, D>(deserializer: D) -> Result<f64, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Num {
+            F(f64),
+            I(i64),
+            U(u64),
+            S(String),
+        }
+        match Num::deserialize(deserializer)? {
+            Num::F(v) => Ok(v),
+            Num::I(v) => Ok(v as f64),
+            Num::U(v) => Ok(v as f64),
+            Num::S(s) => s.parse().map_err(serde::de::Error::custom),
+        }
+    }
+
     #[derive(Debug, Deserialize, Clone)]
     pub struct TLTransaction {
         pub transaction_id: String,
         pub timestamp: String,
+        #[serde(default)]
         pub description: String,
+        #[serde(deserialize_with = "deserialize_amount")]
         pub amount: f64,
         pub currency: String,
+        #[serde(default)]
         pub transaction_type: String,
         #[serde(default)]
         pub transaction_category: Option<String>,
@@ -1120,5 +1183,24 @@ pub mod truelayer {
     pub struct TLAmount {
         pub amount: f64,
         pub currency: String,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truelayer::TLTransaction;
+
+    #[test]
+    fn parses_amount_as_string_and_missing_description() {
+        let raw = r#"{
+            "transaction_id": "abc",
+            "timestamp": "2026-09-01T00:00:00Z",
+            "amount": "14.40",
+            "currency": "GBP",
+            "transaction_type": "DEBIT"
+        }"#;
+        let txn: TLTransaction = serde_json::from_str(raw).unwrap();
+        assert!((txn.amount - 14.40).abs() < 1e-9);
+        assert!(txn.description.is_empty());
     }
 }

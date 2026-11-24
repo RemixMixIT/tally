@@ -14,6 +14,9 @@
 //! Parser is RFC 4180 (quoted fields, doubled quotes, commas inside quotes are not delimiters).
 
 use crate::AppState;
+use crate::learn::LearnEngine;
+use crate::models::Transaction;
+use crate::rules::{self, CompiledRules};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
@@ -171,6 +174,14 @@ async fn commit_csv(
     // (timestamp, row_index, balance_cents) of the chronologically latest row with a balance.
     let mut latest_balance: Option<(i64, usize, i64)> = None;
 
+    let rules_raw = db.list_rules(true).await.unwrap_or_default();
+    let compiled_rules = CompiledRules::compile(rules_raw);
+    let mut learned = LearnEngine::from_db(db)
+        .await
+        .unwrap_or_else(|_| LearnEngine::from_parts(Vec::new(), &[]));
+    let bills = db.list_bills().await.unwrap_or_default();
+    let bill_matchers = crate::bill_match::compile(&bills);
+
     for (row_n, rec) in rows.iter().enumerate() {
         let cell = |i: usize| rec.get(i).map(|s| s.as_str()).unwrap_or("");
         let raw_row: String = rec.join("\u{1f}");
@@ -234,6 +245,31 @@ async fn commit_csv(
             continue;
         }
 
+        let pseudo = Transaction {
+            id: 0,
+            account_id: body.account_id,
+            provider_txn_id: hash.clone(),
+            timestamp: ts,
+            description: desc.clone(),
+            amount_cents,
+            currency: currency.clone(),
+            is_credit: if is_credit { 1 } else { 0 },
+            is_pending: 0,
+            merchant_name: None,
+            counterparty_iban: None,
+            counterparty_name: None,
+            category_id: None,
+            notes: None,
+            raw_json: None,
+            transfer_pair_id: None,
+            transfer_unmatchable: 0,
+            transfer_await_account_id: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let (category_id, _) = learned.category_for_new(&pseudo, &compiled_rules);
+        let eff = rules::apply(&pseudo, &compiled_rules);
+
         let new_id = match db
             .upsert_transaction(
                 body.account_id,
@@ -247,8 +283,8 @@ async fn commit_csv(
                 None,
                 None,
                 None,
-                None,
-                None,
+                category_id,
+                eff.set_notes.as_deref(),
                 None,
             )
             .await
@@ -259,8 +295,32 @@ async fn commit_csv(
                 continue;
             }
         };
+        if let Some(cid) = category_id {
+            learned.observe(None, &desc, cid);
+        }
+        if let Err(e) = crate::pairs::on_new_transaction(db, new_id).await {
+            tracing::warn!("pair/await for csv txn {new_id}: {e:#}");
+        }
+        for tid in &eff.add_tag_ids {
+            let _ = db.tag_transaction(new_id, *tid).await;
+        }
+        for rid in &eff.rules_fired {
+            let _ = db.bump_rule_applied(*rid).await;
+        }
         let _ = db
             .record_txn_imported(body.account_id, &hash, Some(new_id), false, None)
+            .await;
+        let _ = db
+            .auto_link_bill_if_matched(
+                &bill_matchers,
+                body.account_id,
+                new_id,
+                &desc,
+                None,
+                amount_cents,
+                is_credit,
+                ts,
+            )
             .await;
         imported += 1;
     }
@@ -527,6 +587,138 @@ mod tests {
             conn: std::sync::Arc::new(conn),
             crypto,
         }
+    }
+
+    #[tokio::test]
+    async fn csv_import_matches_regular_in_window() {
+        let db = test_db().await;
+        let acct = db
+            .create_manual_account("Smile", "current", None)
+            .await
+            .unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 8, 24)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let bill_id = db
+            .create_bill(
+                "KCOM",
+                3894,
+                4304,
+                "GBP",
+                "monthly",
+                Some(expected),
+                Some("KCOM"),
+                None,
+                Some(acct.id),
+                false,
+            )
+            .await
+            .unwrap();
+        let body = CommitBody {
+            content: SMILE.to_string(),
+            account_id: acct.id,
+            mapping: smile_mapping(),
+            currency: None,
+        };
+        let (imported, _, errors) = commit_csv(&db, &body).await.unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(imported, 3);
+        let txns = db
+            .list_transactions(Some(&[acct.id]), None, None, None, None, None, None, Some("KCOM"), 10, 0)
+            .await
+            .unwrap();
+        assert!(db.bill_payment_exists(bill_id, txns[0].id).await.unwrap());
+        let bill = db.get_bill(bill_id).await.unwrap().unwrap();
+        assert!(bill.next_expected_date.unwrap() > expected);
+        assert_eq!(bill.expected_amount_min_cents, 3894);
+        assert_eq!(bill.expected_amount_max_cents, 4304);
+    }
+
+    #[tokio::test]
+    async fn csv_out_of_window_amount_does_not_auto_link() {
+        let db = test_db().await;
+        let acct = db
+            .create_manual_account("Smile", "current", None)
+            .await
+            .unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 8, 24)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let bill_id = db
+            .create_bill(
+                "KCOM",
+                1000,
+                1100,
+                "GBP",
+                "monthly",
+                Some(expected),
+                Some("KCOM"),
+                None,
+                Some(acct.id),
+                false,
+            )
+            .await
+            .unwrap();
+        let body = CommitBody {
+            content: SMILE.to_string(),
+            account_id: acct.id,
+            mapping: smile_mapping(),
+            currency: None,
+        };
+        commit_csv(&db, &body).await.unwrap();
+        let txns = db
+            .list_transactions(Some(&[acct.id]), None, None, None, None, None, None, Some("KCOM"), 10, 0)
+            .await
+            .unwrap();
+        assert!(!db.bill_payment_exists(bill_id, txns[0].id).await.unwrap());
+        // Confirm this-payment-only: links, leaves window, rolls date.
+        db.mark_bill_paid_by_transaction(bill_id, txns[0].id, txns[0].timestamp, false, txns[0].amount_cents)
+            .await
+            .unwrap();
+        let after = db.get_bill(bill_id).await.unwrap().unwrap();
+        assert_eq!(after.expected_amount_min_cents, 1000);
+        assert_eq!(after.expected_amount_max_cents, 1100);
+        assert!(after.next_expected_date.unwrap() > expected);
+
+        let bill2 = db
+            .create_bill(
+                "TESCO shop",
+                1000,
+                1100,
+                "GBP",
+                "monthly",
+                Some(
+                    chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                        .timestamp(),
+                ),
+                Some("TESCO"),
+                None,
+                Some(acct.id),
+                false,
+            )
+            .await
+            .unwrap();
+        let tesco = db
+            .list_transactions(Some(&[acct.id]), None, None, None, None, None, None, Some("TESCO"), 10, 0)
+            .await
+            .unwrap();
+        db.mark_bill_paid_by_transaction(bill2, tesco[0].id, tesco[0].timestamp, true, tesco[0].amount_cents)
+            .await
+            .unwrap();
+        let updated = db.get_bill(bill2).await.unwrap().unwrap();
+        let (min, max) = crate::bill_match::window_from_amount(tesco[0].amount_cents);
+        assert_eq!(updated.expected_amount_min_cents, min);
+        assert_eq!(updated.expected_amount_max_cents, max);
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 //! Middleware: gate protected routes behind a valid axum-login session (fully authenticated,
-//! i.e. past 2FA) OR a valid OIDC access token issued by the configured IdP.
+//! i.e. past 2FA), a Queeg hub SSO cookie, OR a valid OIDC access token issued by the
+//! configured IdP.
 //!
 //! There is no legacy hashed-API-token path. Programmatic clients (Home Assistant, scripts)
 //! authenticate with an OIDC bearer token from the same provider that powers `/mcp`.
@@ -23,7 +24,14 @@ pub async fn require_auth(
     if auth_session.user.is_some() {
         return Ok(next.run(req).await);
     }
-    // 2) OIDC access token from the configured IdP, for programmatic clients.
+    // 2) Queeg hub SSO cookie (same username as a Tally user). nginx already checked the grant.
+    if crate::queeg_sso::user_from_headers(state.as_ref(), req.headers())
+        .await
+        .is_some()
+    {
+        return Ok(next.run(req).await);
+    }
+    // 3) OIDC access token from the configured IdP, for programmatic clients.
     if let Some(cfg) = &state.oidc {
         if let Some(raw) = req
             .headers()

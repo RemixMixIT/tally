@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   flexRender,
@@ -15,15 +15,12 @@ import {
   ArrowUpRight,
   Search,
   X,
-  Tag,
-  Hash,
-  Calendar,
-  Building2,
-  Receipt,
-  StickyNote,
 } from "lucide-react";
+import { CategorySelect } from "@/components/CategorySelect";
+import { TransactionDrawer } from "@/components/TransactionDrawer";
+import { facetCategoryLabel } from "@/lib/categories";
 import { api } from "@/lib/api";
-import { formatMoney, formatDate } from "@/lib/format";
+import { formatMoney, formatDate, displayPayee } from "@/lib/format";
 import type {
   Account,
   Category,
@@ -90,7 +87,11 @@ function TransactionsPage() {
   const setCategory = useMutation({
     mutationFn: ({ id, cat }: { id: number; cat: number | null }) =>
       api.patch(`/api/transactions/${id}`, { category_id: cat }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["transactions"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["transactions"] });
+      qc.invalidateQueries({ queryKey: ["transactions-review"] });
+      qc.invalidateQueries({ queryKey: ["transfers"] });
+    },
   });
 
   const saveNotes = useMutation({
@@ -173,11 +174,14 @@ function TransactionsPage() {
       },
       {
         id: "description",
-        accessorFn: (r) => r.merchant_name || r.description,
+        accessorFn: (r) => displayPayee(r),
         header: "Description",
         cell: (info) => (
           <div className="truncate">
             <span className="font-medium">{info.getValue<string>()}</span>
+            {info.row.original.transfer_pair_id != null && (
+              <span className="pill-grey ml-2">Transfer</span>
+            )}
             {info.row.original.is_pending === 1 && (
               <span className="pill-orange ml-2">Pending</span>
             )}
@@ -194,23 +198,17 @@ function TransactionsPage() {
           const cats = categories.data?.categories ?? [];
           return (
             <div className="flex items-center gap-1.5">
-              <select
+              <CategorySelect
                 className="text-xs bg-transparent border border-thin px-1.5 py-0.5 focus:outline-none focus:border-green"
-                value={cid ?? ""}
-                onChange={(e) =>
+                categories={cats}
+                value={cid}
+                onChange={(cat) =>
                   setCategoryRef.current({
                     id: t.id,
-                    cat: e.target.value ? Number(e.target.value) : null,
+                    cat,
                   })
                 }
-              >
-                <option value="">Uncategorised</option>
-                {cats.map((cc) => (
-                  <option key={cc.id} value={cc.id}>
-                    {cc.name}
-                  </option>
-                ))}
-              </select>
+              />
               {aiSettings.data?.openrouter_configured && !cid && (
                 <button
                   className="btn-ghost text-[10px] !px-1.5 !py-0.5"
@@ -271,7 +269,13 @@ function TransactionsPage() {
             <em>Transactions</em>
           </h1>
           <p className="text-sm text-mid">
-            {txns.data?.total ?? 0} total · showing {rows.length}
+            {txns.data?.total ?? 0} total · showing {rows.length}{" "}
+            <Link to="/transfers" className="text-green hover:underline ml-1">
+              Transfers
+            </Link>
+            <Link to="/review" className="text-green hover:underline ml-1">
+              Review queue
+            </Link>
           </p>
         </div>
         {aiSettings.data?.openrouter_configured && (
@@ -336,7 +340,12 @@ function TransactionsPage() {
           }}
           options={
             categories.data?.categories.map((c) => ({
-              label: c.name,
+              label: facetCategoryLabel(
+                c,
+                new Map(
+                  (categories.data?.categories ?? []).map((x) => [x.id, x])
+                )
+              ),
               value: c.id,
             })) ?? []
           }
@@ -396,6 +405,7 @@ function TransactionsPage() {
         <TransactionDrawer
           txn={selectedTxn}
           account={amap.get(selectedTxn.account_id) ?? null}
+          accounts={accounts.data?.accounts ?? []}
           category={selectedTxn.category_id ? cmap.get(selectedTxn.category_id) ?? null : null}
           categories={categories.data?.categories ?? []}
           onClose={() => setSelectedId(null)}
@@ -407,189 +417,6 @@ function TransactionsPage() {
           }
         />
       )}
-    </div>
-  );
-}
-
-function TransactionDrawer({
-  txn,
-  account,
-  category,
-  categories,
-  onClose,
-  onSetCategory,
-  onSetNotes,
-}: {
-  txn: Transaction;
-  account: Account | null;
-  category: Category | null;
-  categories: Category[];
-  onClose: () => void;
-  onSetCategory: (id: number | null) => void;
-  onSetNotes: (notes: string | null) => void;
-}) {
-  const [notesDraft, setNotesDraft] = useState(txn.notes ?? "");
-  useEffect(() => {
-    setNotesDraft(txn.notes ?? "");
-  }, [txn.id, txn.notes]);
-  return (
-    <>
-      <div
-        className="fixed inset-0 bg-ink/20 backdrop-blur-sm z-40"
-        onClick={onClose}
-      />
-      <aside className="fixed right-0 top-0 bottom-0 w-full sm:w-[480px] bg-cream border-l border-thin z-50 overflow-y-auto fade-in shadow-2xl">
-        <header className="sticky top-0 bg-cream/95 backdrop-blur p-5 border-b border-thin flex items-center justify-between">
-          <div className="min-w-0 flex-1">
-            <p className="text-[10px] uppercase tracking-widest text-mid mb-1">
-              Transaction · #{txn.id}
-            </p>
-            <h2 className="text-xl font-extrabold truncate">
-              {txn.merchant_name || txn.description}
-            </h2>
-          </div>
-          <button
-            className="btn-ghost p-1.5 -m-1.5"
-            onClick={onClose}
-            aria-label="Close"
-          >
-            <X className="size-5" />
-          </button>
-        </header>
-
-        <div className="p-5 space-y-6">
-          {/* Amount hero */}
-          <div className="text-center py-4">
-            <p
-              className={`mono font-extrabold text-5xl tracking-tight ${
-                txn.is_credit ? "text-green" : "text-ink"
-              }`}
-            >
-              {txn.is_credit ? "+" : "−"}
-              {formatMoney(txn.amount_cents, txn.currency)}
-            </p>
-            {txn.is_pending === 1 && (
-              <span className="pill-orange mt-2 inline-block">Pending</span>
-            )}
-          </div>
-
-          {/* Core facts */}
-          <dl className="space-y-3">
-            <DrawerRow icon={<Calendar className="size-4" />} label="Date">
-              <span className="mono text-sm">{formatDate(txn.timestamp)}</span>
-              <span className="text-mid text-xs ml-2">
-                {new Date(txn.timestamp * 1000).toLocaleTimeString("en-GB")}
-              </span>
-            </DrawerRow>
-            <DrawerRow icon={<Building2 className="size-4" />} label="Account">
-              <span className="text-sm font-medium">
-                {account?.custom_display_name || account?.display_name || "—"}
-              </span>
-              {account?.iban && (
-                <p className="mono text-[11px] text-mid mt-0.5">{account.iban}</p>
-              )}
-              {account?.card_last4 && (
-                <p className="mono text-[11px] text-mid mt-0.5">•••• {account.card_last4}</p>
-              )}
-            </DrawerRow>
-            <DrawerRow icon={<Receipt className="size-4" />} label="Description">
-              <p className="text-sm break-words">{txn.description}</p>
-              {txn.merchant_name && txn.merchant_name !== txn.description && (
-                <p className="text-xs text-mid mt-1">
-                  Merchant: <span className="font-medium">{txn.merchant_name}</span>
-                </p>
-              )}
-            </DrawerRow>
-            {(txn.counterparty_name || txn.counterparty_iban) && (
-              <DrawerRow icon={<Hash className="size-4" />} label="Counterparty">
-                {txn.counterparty_name && (
-                  <p className="text-sm">{txn.counterparty_name}</p>
-                )}
-                {txn.counterparty_iban && (
-                  <p className="mono text-[11px] text-mid mt-0.5">
-                    {txn.counterparty_iban}
-                  </p>
-                )}
-              </DrawerRow>
-            )}
-            <DrawerRow icon={<Tag className="size-4" />} label="Category">
-              <select
-                className="input text-sm py-1.5"
-                value={txn.category_id ?? ""}
-                onChange={(e) =>
-                  onSetCategory(e.target.value ? Number(e.target.value) : null)
-                }
-              >
-                <option value="">Uncategorised</option>
-                {categories.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                  </option>
-                ))}
-              </select>
-              {category && (
-                <p className="text-[11px] text-mid mt-1">
-                  Currently: <span className="font-semibold">{category.name}</span>
-                </p>
-              )}
-            </DrawerRow>
-            <DrawerRow icon={<StickyNote className="size-4" />} label="Notes">
-              <textarea
-                className="input text-sm w-full"
-                rows={3}
-                value={notesDraft}
-                onChange={(e) => setNotesDraft(e.target.value)}
-                onBlur={() => {
-                  const next = notesDraft.trim() || null;
-                  if (next !== (txn.notes ?? null)) onSetNotes(next);
-                }}
-                placeholder="Add a note (autosaves on blur)"
-              />
-            </DrawerRow>
-          </dl>
-
-          {/* Raw provider data — collapsed by default */}
-          <details className="card p-3 bg-ink/[0.02]">
-            <summary className="text-[10px] uppercase tracking-widest text-mid cursor-pointer">
-              Raw provider payload
-            </summary>
-            <pre className="text-[10px] mono mt-2 overflow-x-auto whitespace-pre-wrap break-all">
-              {JSON.stringify(
-                {
-                  provider_txn_id: txn.provider_txn_id,
-                  timestamp: txn.timestamp,
-                  is_credit: txn.is_credit,
-                  is_pending: txn.is_pending,
-                  amount_cents: txn.amount_cents,
-                  currency: txn.currency,
-                },
-                null,
-                2
-              )}
-            </pre>
-          </details>
-        </div>
-      </aside>
-    </>
-  );
-}
-
-function DrawerRow({
-  icon,
-  label,
-  children,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex gap-3">
-      <dt className="text-mid shrink-0 w-28 flex items-start gap-1.5 text-[11px] uppercase tracking-widest pt-1">
-        {icon}
-        {label}
-      </dt>
-      <dd className="flex-1 min-w-0">{children}</dd>
     </div>
   );
 }

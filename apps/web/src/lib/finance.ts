@@ -158,6 +158,33 @@ export function holdingsAllowed(cls: string): boolean {
   return cls === "investment" || cls === "pension";
 }
 
+export function isCashHolding(h: {
+  ticker_or_identifier?: string | null;
+  holding_name?: string | null;
+}): boolean {
+  const ticker = (h.ticker_or_identifier ?? "").trim();
+  if (ticker.toUpperCase() === "CASH") return true;
+  return (h.holding_name ?? "")
+    .split(/[^A-Za-z0-9]+/)
+    .some((t) => t.toLowerCase() === "cash");
+}
+
+/** Convert a register holding's cost basis into GBP using the stored native/GBP pair. */
+export function holdingCostGbp(h: {
+  cost_basis: number | null;
+  currency: string;
+  native_value: number;
+  gbp_value: number;
+  ticker_or_identifier?: string | null;
+  holding_name?: string | null;
+}): number | null {
+  if (isCashHolding(h)) return h.gbp_value;
+  if (h.cost_basis == null) return null;
+  if (h.currency === "GBP") return h.cost_basis;
+  if (Math.abs(h.native_value) < 1e-9) return null;
+  return h.cost_basis * (h.gbp_value / h.native_value);
+}
+
 export function isoToday(): string {
   return new Date().toISOString().slice(0, 10);
 }

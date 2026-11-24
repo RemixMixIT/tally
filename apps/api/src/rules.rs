@@ -134,6 +134,31 @@ fn matches_rule(txn: &Transaction, cr: &CompiledRule) -> bool {
     true
 }
 
+/// First matching rule's category. When `account_scoped_only`, global (no
+/// `match_account_id`) rules are skipped so mixed payees like PayPal eBay stay
+/// uncategorised unless a dedicated-account rule files them.
+pub fn winning_category(
+    txn: &Transaction,
+    rules: &CompiledRules,
+    account_scoped_only: bool,
+) -> Option<i64> {
+    for cr in &rules.rules {
+        if cr.rule.enabled == 0 {
+            continue;
+        }
+        if account_scoped_only && cr.rule.match_account_id.is_none() {
+            continue;
+        }
+        if !matches_rule(txn, cr) {
+            continue;
+        }
+        if let Some(cid) = cr.rule.set_category_id {
+            return Some(cid);
+        }
+    }
+    None
+}
+
 /// Run rules against existing transactions in DB (for "rebuild after creating a new rule").
 /// Returns counts of (matched, mutated).
 pub async fn run_all(
@@ -164,7 +189,9 @@ pub async fn run_all(
             }
             matched += 1;
             let mut did = false;
-            if let Some(cid) = eff.set_category_id {
+            let always_manual =
+                crate::learn::is_always_manual(t.merchant_name.as_deref(), &t.description);
+            if let Some(cid) = winning_category(t, rules, always_manual) {
                 if t.category_id != Some(cid) {
                     db.update_transaction_category(t.id, Some(cid)).await?;
                     did = true;

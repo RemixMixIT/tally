@@ -45,6 +45,7 @@ export interface Account {
   balance_updated_at: number | null;
   consent_nickname: string | null;
   pending_net_cents: number | null;
+  funding_slack_cents?: number;
 }
 
 export interface Transaction {
@@ -62,8 +63,31 @@ export interface Transaction {
   counterparty_name: string | null;
   category_id: number | null;
   notes: string | null;
+  /** Extracted payee (issued-by company, fee/period stripped). */
+  payee?: string;
+  transfer_pair_id: number | null;
+  transfer_unmatchable?: number;
+  transfer_await_account_id?: number | null;
+  preferred_account?: { id: number; name: string } | null;
+  await_account?: { id: number; name: string } | null;
   created_at: number;
   updated_at: number;
+}
+
+export interface TransferPairInfo {
+  other: Transaction;
+  implied_fx_rate: number | null;
+}
+
+export interface PairSuggestion {
+  other: Transaction;
+  implied_fx_rate: number | null;
+  leaf: string;
+}
+
+export interface PreferredPairAccount {
+  id: number;
+  name: string;
 }
 
 export interface Category {
@@ -127,6 +151,41 @@ export interface Bill {
   last_paid_date: number | null;
   match_description_regex: string | null;
   enabled: number;
+  source_recurring_id?: number | null;
+  account_id: number | null;
+  is_inflow: number;
+}
+
+export interface AmountException {
+  bill: Bill;
+  transaction: Transaction;
+}
+
+export interface FundingLine {
+  bill_id: number;
+  name: string;
+  expected_date: number;
+  expected_amount_cents: number;
+  is_inflow: boolean;
+}
+
+export interface FundingForecast {
+  account_id: number;
+  account_name: string;
+  current_balance_cents: number;
+  slack_cents: number;
+  remaining_net_out_cents: number;
+  this_month_net_cents?: number;
+  next_month_net_cents?: number;
+  transfer_in_cents: number;
+  month_end: number;
+  next_month_label?: string;
+  next_month_start?: number;
+  next_month_end?: number;
+  this_month_lines?: FundingLine[];
+  next_month_lines?: FundingLine[];
+  lines: FundingLine[];
+  warnings: string[];
 }
 
 export interface Consent {
@@ -150,6 +209,16 @@ export interface MeResponse {
 export interface TransactionsListResponse {
   transactions: Transaction[];
   total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface TransfersListResponse {
+  transactions: Transaction[];
+  total: number;
+  all_total: number;
+  unpaired_total: number;
+  status: "all" | "unpaired";
   limit: number;
   offset: number;
 }
@@ -209,6 +278,12 @@ export interface ItemHolding {
   gbp_value: number;
   source_reference: string | null;
   notes: string | null;
+}
+
+export interface RegisterHoldingGroup {
+  item: FinancialItem;
+  holdings: ItemHolding[];
+  total_gbp: number;
 }
 
 export interface PropertyDetails {
@@ -312,6 +387,45 @@ export interface ClassSubtotal {
   liabilities_gbp: number;
 }
 
+export interface NamedAmount {
+  name: string;
+  gbp_per_month: number;
+}
+
+export interface SkippedFx {
+  currency: string;
+  transaction_count: number;
+  native_cents: number;
+}
+
+export interface ExpenditureCountedLine {
+  name: string;
+  detail: string;
+  gbp_per_month: number;
+  transaction_count: number;
+}
+
+export interface ExpenditureExcludedLine {
+  name: string;
+  reason: string;
+  gbp_value: number | null;
+  transaction_count: number;
+  per_month: boolean;
+}
+
+export interface ExpenditureReport {
+  months: string[];
+  month_count: number;
+  is_rolling_12: boolean;
+  caption: string;
+  total_gbp_per_month: number;
+  groups: NamedAmount[];
+  categories: NamedAmount[];
+  skipped_fx: SkippedFx[];
+  counted: ExpenditureCountedLine[];
+  excluded: ExpenditureExcludedLine[];
+}
+
 export interface NetWorthReport {
   as_of: string | null;
   assets_gbp: number;
@@ -321,6 +435,60 @@ export interface NetWorthReport {
   counted: CountedLine[];
   excluded: ExcludedLine[];
   unreconciled: UnreconciledLine[];
+}
+
+export interface RetirementMonthPnl {
+  year_month: string;
+  start_gbp: number | null;
+  end_gbp: number | null;
+  equity_change_gbp: number | null;
+  contributions_gbp: number | null;
+  withdrawals_gbp: number | null;
+  cashflow_complete: boolean;
+  pnl_gbp: number | null;
+}
+
+export interface RetirementBook {
+  id: number;
+  name: string;
+  kind: string;
+  planning_annual_return: number | null;
+  capital_gbp: number | null;
+  valuation_date: string | null;
+  this_month: RetirementMonthPnl;
+}
+
+export interface RetirementMonth {
+  year_month: string;
+  pnl_gbp: number | null;
+  cashflow_complete: boolean;
+  equity_change_gbp: number | null;
+}
+
+export interface RetirementTrackerPoint {
+  date: string;
+  year_month: string;
+  estimate_gbp: number;
+  off_track_below_gbp: number;
+  month_pnl_gbp: number | null;
+  trailing_6m_gbp: number | null;
+  is_checkpoint: boolean;
+}
+
+export interface RetirementReport {
+  as_of: string;
+  tms_capital_gbp: number;
+  this_month_pnl_gbp: number | null;
+  this_month_cashflow_complete: boolean;
+  trailing_6m_avg_gbp: number | null;
+  path_target_gbp: number;
+  off_track_below_gbp: number;
+  on_track: boolean | null;
+  trailing_months_ready: number;
+  books: RetirementBook[];
+  months: RetirementMonth[];
+  tracker: RetirementTrackerPoint[];
+  notes: string[];
 }
 
 export interface FinancialItemRow {

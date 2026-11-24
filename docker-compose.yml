@@ -19,9 +19,14 @@ services:
     restart: unless-stopped
     ports:
       # Bound to localhost — put a TLS reverse proxy (Caddy/Traefik) in front for remote access.
-      - "0.0.0.0:3001:3001"
+      - "127.0.0.1:3001:3001"
     volumes:
       - tally-data:/app/data
+      # Batty CSV + Vanquis / Capital on Tap PDFs copied here by host rclone
+      # (scripts/sync-tally-valuation-feed.sh, scripts/sync-tally-vanquis-statements.sh,
+      #  scripts/sync-tally-capital-on-tap-statements.sh).
+      # Dropbox drop → inbound; OneDrive is the archive after import.
+      - ./data/inbound:/app/inbound:ro
     env_file:
       - .env
     healthcheck:

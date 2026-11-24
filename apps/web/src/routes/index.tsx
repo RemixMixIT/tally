@@ -1,10 +1,13 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
-import { formatMoney, formatGbp, relativeTime } from "@/lib/format";
+import { formatMoney, formatGbp, formatDate, relativeTime, displayPayee } from "@/lib/format";
 import { accountTypeLabel } from "@/lib/account-types";
 import type { Consent } from "@/types/api";
 import { PortfolioChart } from "@/components/PortfolioChart";
+import { holdingCostGbp } from "@/lib/finance";
+import { transferCategoryIds } from "@/lib/categories";
+import type { RegisterHoldingGroup } from "@/types/api";
 import {
   chartColors,
   chartAxisProps,
@@ -14,6 +17,8 @@ import {
 import type {
   Account,
   Bill,
+  Category,
+  FundingForecast,
   TransactionsListResponse,
 } from "@/types/api";
 import {
@@ -59,6 +64,22 @@ function Dashboard() {
     queryKey: ["bills", "all"],
     queryFn: () => api.get<{ bills: Bill[] }>("/api/bills"),
   });
+  const smileAccount = (accounts.data?.accounts ?? []).find((a) => {
+    const label = (a.custom_display_name || a.display_name).toLowerCase();
+    return label.includes("smile");
+  });
+  const smileFunding = useQuery({
+    queryKey: ["bills", "funding", smileAccount?.id],
+    queryFn: () =>
+      api.get<FundingForecast>(
+        `/api/bills/funding?account_id=${smileAccount!.id}`,
+      ),
+    enabled: smileAccount != null,
+  });
+  const categories = useQuery({
+    queryKey: ["categories"],
+    queryFn: () => api.get<{ categories: Category[] }>("/api/categories"),
+  });
   const netWorth = useQuery({
     queryKey: ["holdings-net-worth"],
     queryFn: () =>
@@ -67,6 +88,10 @@ function Dashboard() {
         holdings_cost_basis: number;
         holdings_unrealised_gain: number;
       }>("/api/holdings/net-worth"),
+  });
+  const register = useQuery({
+    queryKey: ["register-holdings"],
+    queryFn: () => api.get<{ groups: RegisterHoldingGroup[] }>("/api/register-holdings"),
   });
   const financeNetWorth = useQuery({
     queryKey: ["net-worth"],
@@ -81,19 +106,22 @@ function Dashboard() {
   });
 
   const spendSeries = useQuery({
-    queryKey: ["spend-series"],
+    queryKey: ["spend-series", categories.data?.categories.map((c) => c.id).join(",")],
     queryFn: async () => {
       const to = Math.floor(Date.now() / 1000);
       const from = to - 30 * 86_400;
       const txns = await api.get<TransactionsListResponse>(
         `/api/transactions?from=${from}&to=${to}&is_credit=false&limit=1000`
       );
+      const skip = transferCategoryIds(categories.data?.categories ?? []);
       const byDay: Record<string, number> = {};
       for (let d = 0; d < 30; d++) {
         const ts = (from + d * 86_400) * 1000;
         byDay[new Date(ts).toISOString().slice(0, 10)] = 0;
       }
       for (const t of txns.transactions) {
+        if (t.transfer_pair_id != null) continue;
+        if (t.category_id != null && skip.has(t.category_id)) continue;
         const day = new Date(t.timestamp * 1000).toISOString().slice(0, 10);
         if (byDay[day] !== undefined) byDay[day] += t.amount_cents;
       }
@@ -106,9 +134,19 @@ function Dashboard() {
 
   const totalSpend30d =
     spendSeries.data?.reduce((acc, d) => acc + d.spend, 0) ?? 0;
-  const market = netWorth.data?.holdings_market_value ?? 0;
-  const gain = netWorth.data?.holdings_unrealised_gain ?? 0;
-  const cost = netWorth.data?.holdings_cost_basis ?? 0;
+  const registerMarket = (register.data?.groups ?? []).reduce(
+    (s, g) => s + g.total_gbp,
+    0
+  );
+  const registerCost = (register.data?.groups ?? []).reduce(
+    (s, g) =>
+      s +
+      g.holdings.reduce((hs, h) => hs + (holdingCostGbp(h) ?? 0), 0),
+    0
+  );
+  const market = (netWorth.data?.holdings_market_value ?? 0) + registerMarket;
+  const cost = (netWorth.data?.holdings_cost_basis ?? 0) + registerCost;
+  const gain = market - cost;
   const gainPct = cost > 0 ? (gain / cost) * 100 : 0;
   const portfolioPositive = gain >= 0;
   const financeNw = financeNetWorth.data?.net_worth;
@@ -227,7 +265,14 @@ function Dashboard() {
             </Link>
           </div>
           <div className="flex-1 min-h-[200px]">
-            <PortfolioChart showRangePicker={false} height={220} defaultRange="3mo" />
+            {registerMarket > 0 && (netWorth.data?.holdings_market_value ?? 0) === 0 ? (
+              <p className="text-sm text-mid mt-6 max-w-sm">
+                SIPP holdings come from the Batty valuation feed. Open Investments
+                to see positions. The Yahoo chart covers broker activity only.
+              </p>
+            ) : (
+              <PortfolioChart showRangePicker={false} height={220} defaultRange="3mo" />
+            )}
           </div>
         </section>
 
@@ -453,12 +498,11 @@ function Dashboard() {
           )}
         </section>
 
-        {/* Direct debits & bills — no dates (DD dates can't be reliably forecast; see notes).
-            Deduped by name so duplicate mandates don't show twice. */}
+        {/* Direct debits & regular payments — expected dates come from each regular. */}
         <section className="card p-7 col-span-12 lg:col-span-5">
           <div className="flex items-baseline justify-between mb-4">
             <h2 className="text-lg font-semibold">
-              Direct debits <em className="text-mid">&amp; bills</em>
+              Regular <em className="text-mid">payments</em>
             </h2>
             <Link
               to="/bills"
@@ -467,6 +511,21 @@ function Dashboard() {
               All <ArrowRight className="size-3.5" />
             </Link>
           </div>
+          {smileFunding.data && (
+            <div className="mb-4 pb-4 border-b border-thin">
+              <p className="text-[11px] uppercase tracking-widest text-mid mb-1">
+                Smile · fund{" "}
+                {smileFunding.data.next_month_label ?? "next month"}
+              </p>
+              <p className="text-xl font-extrabold tracking-tight">
+                Transfer in {formatMoney(smileFunding.data.transfer_in_cents)}
+              </p>
+              <p className="text-[11px] text-mid mt-0.5">
+                remaining this month plus next month, with{" "}
+                {formatMoney(smileFunding.data.slack_cents)} slack
+              </p>
+            </div>
+          )}
           {(() => {
             const seen = new Set<string>();
             const deduped = (upcoming.data?.bills ?? []).filter((b) => {
@@ -482,7 +541,14 @@ function Dashboard() {
                     key={b.id}
                     className="flex items-center justify-between text-sm pb-3 border-b border-thin last:border-0 last:pb-0"
                   >
-                    <p className="font-medium truncate min-w-0">{b.name}</p>
+                    <div className="min-w-0">
+                      <p className="font-medium truncate">{b.name}</p>
+                      {b.next_expected_date && (
+                        <p className="text-[11px] text-mid">
+                          {formatDate(b.next_expected_date)}
+                        </p>
+                      )}
+                    </div>
                     <p className="mono font-semibold shrink-0 ml-2">
                       {b.expected_amount_max_cents > 0
                         ? formatMoney(b.expected_amount_max_cents, b.currency)
@@ -492,7 +558,7 @@ function Dashboard() {
                 ))}
               </ul>
             ) : (
-              <p className="text-sm text-mid">No direct debits or bills yet.</p>
+              <p className="text-sm text-mid">No regular payments yet.</p>
             );
           })()}
         </section>
@@ -530,7 +596,7 @@ function Dashboard() {
                     </td>
                     <td className="py-3 pr-3">
                       <span className="font-medium">
-                        {t.merchant_name || t.description}
+                        {displayPayee(t)}
                       </span>
                       {t.is_pending ? (
                         <span className="pill-orange ml-2">Pending</span>

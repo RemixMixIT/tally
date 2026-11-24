@@ -61,6 +61,28 @@ pub async fn patch(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
     }
 
+    if body.get("funding_slack").is_some() || body.get("funding_slack_cents").is_some() {
+        let cents = if let Some(v) = body.get("funding_slack_cents") {
+            v.as_i64()
+                .or_else(|| v.as_f64().map(|n| n.round() as i64))
+                .ok_or((StatusCode::BAD_REQUEST, "funding_slack_cents must be a number".into()))?
+        } else {
+            let n = body
+                .get("funding_slack")
+                .and_then(|v| v.as_f64())
+                .ok_or((StatusCode::BAD_REQUEST, "funding_slack must be a number".into()))?;
+            (n * 100.0).round() as i64
+        };
+        if cents < 0 {
+            return Err((StatusCode::BAD_REQUEST, "funding slack cannot be negative".into()));
+        }
+        state
+            .db
+            .set_funding_slack_cents(id, cents)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    }
+
     if body.get("current_balance").is_some() {
         let account = state
             .db

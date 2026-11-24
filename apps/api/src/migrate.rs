@@ -33,6 +33,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration { version: 13, name: "manual_accounts", sql: include_str!("../migrations/0013_manual_accounts.sql") },
     Migration { version: 14, name: "financial_items", sql: include_str!("../migrations/0014_financial_items.sql") },
     Migration { version: 15, name: "mortgage_property_index", sql: include_str!("../migrations/0015_mortgage_property_index.sql") },
+    Migration { version: 16, name: "transfer_pairs", sql: include_str!("../migrations/0016_transfer_pairs.sql") },
+    Migration { version: 17, name: "transfer_unmatchable", sql: include_str!("../migrations/0017_transfer_unmatchable.sql") },
+    Migration { version: 18, name: "transfer_await", sql: include_str!("../migrations/0018_transfer_await.sql") },
+    Migration { version: 19, name: "bill_account_funding", sql: include_str!("../migrations/0019_bill_account_funding.sql") },
 ];
 
 const LEDGER_DDL: &str = "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
@@ -130,7 +134,7 @@ mod tests {
     async fn fresh_db_applies_all_migrations() {
         let conn = mem().await;
         run(&conn).await.unwrap();
-        assert_eq!(applied_versions(&conn).await, (1..=15).collect::<Vec<_>>());
+        assert_eq!(applied_versions(&conn).await, (1..=19).collect::<Vec<_>>());
         // The real migration SQL produced real tables under libsql (dialect smoke check).
         assert!(app_table_count(&conn).await > 0);
     }
@@ -140,7 +144,7 @@ mod tests {
         let conn = mem().await;
         run(&conn).await.unwrap();
         run(&conn).await.unwrap(); // second run must be a no-op, not an error
-        assert_eq!(applied_versions(&conn).await, (1..=15).collect::<Vec<_>>());
+        assert_eq!(applied_versions(&conn).await, (1..=19).collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -151,7 +155,7 @@ mod tests {
         // and a re-running one would build tables. We assert no app table was created.
         let conn = mem().await;
         conn.execute_batch(LEDGER_DDL).await.unwrap();
-        for v in 1..=15i64 {
+        for v in 1..=19i64 {
             conn.execute(
                 "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
                  VALUES (?1, 'x', 1, ?2, 0)",

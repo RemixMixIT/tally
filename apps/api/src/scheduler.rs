@@ -1,6 +1,10 @@
 //! Background scheduler that periodically iterates enabled consents and runs the importer.
 //!
-//! Default schedule: every hour at minute 7 (chosen to dodge other typical cron-on-the-hour load).
+//! Default schedule: four times a day at minute 7 (00:07, 06:07, 12:07, 18:07).
+//! UK Open Banking caps unattended AIS at about 4 calls/day per endpoint unless
+//! the user's IP is sent as `X-PSU-IP`. The old hourly cron exhausted Tide's
+//! quota by mid-morning, after which transaction fetches 429'd and were stored
+//! as a successful empty sync.
 //! Configurable via `TALLY_SYNC_CRON` env var (5- or 6-field cron expression).
 
 use crate::importer::Importer;
@@ -15,7 +19,7 @@ pub async fn start_scheduler(state: Arc<AppState>) -> Result<JobScheduler> {
     let sched = JobScheduler::new().await?;
 
     let cron_expr = std::env::var("TALLY_SYNC_CRON")
-        .unwrap_or_else(|_| "0 7 * * * *".to_string()); // sec min hour dom mon dow — every hour at :07
+        .unwrap_or_else(|_| "0 7 0,6,12,18 * * *".to_string()); // 4× daily at :07
 
     let state_clone = state.clone();
     let job = Job::new_async(cron_expr.as_str(), move |_uuid, _l| {
@@ -47,8 +51,49 @@ pub async fn start_scheduler(state: Arc<AppState>) -> Result<JobScheduler> {
     })?;
     sched.add(bills_job).await?;
 
+    // Batty valuation CSV (rclone-copied onto /app/inbound). Cadence is twice daily
+    // on Batty; poll every 15 minutes so a 06:45 / 14:20 copy is picked up quickly.
+    let state_clone = state.clone();
+    let feed_job = Job::new_async("0 5,20,35,50 * * * *", move |_uuid, _l| {
+        let state = state_clone.clone();
+        Box::pin(async move {
+            crate::valuation_feed::run_scheduled(&state.db).await;
+        })
+    })?;
+    sched.add(feed_job).await?;
+
+    // Vanquis PDFs copied onto /app/inbound/vanquis by host rclone
+    // (Dropbox drop folder; OneDrive archive after import).
+    let state_clone = state.clone();
+    let vanquis_job = Job::new_async("0 8,23,38,53 * * * *", move |_uuid, _l| {
+        let state = state_clone.clone();
+        Box::pin(async move {
+            crate::vanquis::run_scheduled(&state.db).await;
+        })
+    })?;
+    sched.add(vanquis_job).await?;
+
+    // Capital on Tap PDFs copied onto /app/inbound/capital-on-tap by host rclone
+    // (Dropbox drop folder; OneDrive archive after import).
+    let state_clone = state.clone();
+    let cot_job = Job::new_async("0 9,24,39,54 * * * *", move |_uuid, _l| {
+        let state = state_clone.clone();
+        Box::pin(async move {
+            crate::capital_on_tap::run_scheduled(&state.db).await;
+        })
+    })?;
+    sched.add(cot_job).await?;
+
     sched.start().await?;
     info!(cron = %cron_expr, "scheduler started");
+
+    let startup_state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        crate::valuation_feed::run_scheduled(&startup_state.db).await;
+        crate::vanquis::run_scheduled(&startup_state.db).await;
+        crate::capital_on_tap::run_scheduled(&startup_state.db).await;
+    });
     Ok(sched)
 }
 

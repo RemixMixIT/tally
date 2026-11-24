@@ -29,8 +29,36 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/transactions", get(api::transactions::list))
         .route("/transactions/summary", get(api::transactions::spending_summary))
         .route(
+            "/transactions/review",
+            get(api::transactions::review),
+        )
+        .route(
+            "/transactions/apply-learned",
+            post(api::transactions::apply_learned),
+        )
+        .route(
+            "/transactions/transfers",
+            get(api::transactions::transfers),
+        )
+        .route(
             "/transactions/{id}",
             get(api::transactions::get_one).patch(api::transactions::patch),
+        )
+        .route(
+            "/transactions/{id}/pair-suggestions",
+            get(api::transactions::pair_suggestions),
+        )
+        .route(
+            "/transactions/{id}/pair",
+            post(api::transactions::pair).delete(api::transactions::unpair),
+        )
+        .route(
+            "/transactions/{id}/unmatchable",
+            post(api::transactions::mark_unmatchable).delete(api::transactions::clear_unmatchable),
+        )
+        .route(
+            "/transactions/{id}/await",
+            delete(api::transactions::clear_await),
         )
         .route(
             "/categories",
@@ -53,6 +81,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/budgets/{id}/status", get(api::budgets::status))
         .route("/bills", get(api::bills::list).post(api::bills::create))
         .route("/bills/upcoming", get(api::bills::upcoming))
+        .route("/bills/amount-exceptions", get(api::bills::amount_exceptions))
+        .route("/bills/confirm-match", post(api::bills::confirm_match))
+        .route("/bills/funding", get(api::bills::funding))
         .route(
             "/bills/{id}",
             patch(api::bills::update).delete(api::bills::delete),
@@ -138,6 +169,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(api::finance::list_item_holdings).post(api::finance::create_item_holding),
         )
         .route(
+            "/register-holdings",
+            get(api::finance::list_register_holdings),
+        )
+        .route(
             "/item-holdings/{id}",
             put(api::finance::update_item_holding).delete(api::finance::delete_item_holding),
         )
@@ -158,12 +193,20 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/forecasts/{id}",
             put(api::finance::update_forecast).delete(api::finance::delete_forecast),
         )
+        .route("/expenditure", get(api::expenditure::summary))
         .route("/net-worth", get(api::finance::net_worth))
         .route("/net-worth/history", get(api::finance::net_worth_history))
         .route(
             "/net-worth/explanation",
             get(api::finance::net_worth_explanation),
         )
+        .route("/retirement", get(api::finance::retirement))
+        .route(
+            "/valuation-feed/import",
+            post(api::finance::import_valuation_feed),
+        )
+        .route("/vanquis/import", post(api::vanquis::import))
+        .route("/capital-on-tap/import", post(api::capital_on_tap::import))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::middleware::require_auth,
@@ -224,6 +267,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(oauth::protected_resource_metadata),
         )
         .route("/healthz", get(healthz::healthz))
+        .route("/internal/vanquis/import", post(api::vanquis::import_loopback))
+        .route(
+            "/internal/capital-on-tap/import",
+            post(api::capital_on_tap::import_loopback),
+        )
+        .route(
+            "/internal/apply-learned",
+            post(api::transactions::apply_learned_loopback),
+        )
         .nest("/auth", auth_routes)
         .nest("/api", api_routes)
         .nest_service("/static", ServeDir::new("static"))
