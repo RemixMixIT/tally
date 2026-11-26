@@ -42,6 +42,16 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    networks:
+      - default
+      - immich
 
 volumes:
   tally-data:
+
+# Immich is published on the host loopback only. The receipt poller reaches it
+# by container name on Immich's network: TALLY_IMMICH_BASE_URL=http://immich_server:2283
+networks:
+  immich:
+    name: immich_default
+    external: true
